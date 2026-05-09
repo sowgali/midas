@@ -26,8 +26,9 @@ import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from midas.dedup import apply_merge, find_matching_deal
-from midas.extractors.base import ExtractedDeal, ExtractionContext, Extractor, KnownParty
-from midas.models import Deal, Entity, EvidenceSpan, Source
+from midas.entity_resolution import EntityResolver
+from midas.extractors.base import ExtractedDeal, ExtractionContext, Extractor
+from midas.models import Deal, EvidenceSpan, Source
 from midas.models.types import SourceType
 from midas.parsers import Parser, select_parser
 from midas.sources.base import RawDocument
@@ -37,7 +38,6 @@ from midas.sources.ir_press import IrPress, IrPressConfig
 from midas.sources.sec_edgar import SecEdgar
 from midas.storage.repository import (
     DealRepository,
-    EntityRepository,
     EvidenceRepository,
     SourceRepository,
 )
@@ -60,6 +60,11 @@ class IngestStats:
     sources_skipped_duplicate: int = 0
     deals_added: int = 0
     deals_merged: int = 0
+    # V1.8 — number of NEW Entity rows the resolver auto-created during
+    # this ingest (each tagged ``discovered=True``, ready for review).
+    entities_discovered: int = 0
+    # V1.8 — extracted parties whose names failed the quality filter
+    # ("we", "the Company", etc.) and were dropped without creating a row.
     deals_skipped_unknown_party: int = 0
     evidence_spans_added: int = 0
     errors: list[str] = field(default_factory=list)
@@ -72,64 +77,12 @@ class IngestStats:
             + other.sources_skipped_duplicate,
             deals_added=self.deals_added + other.deals_added,
             deals_merged=self.deals_merged + other.deals_merged,
+            entities_discovered=self.entities_discovered + other.entities_discovered,
             deals_skipped_unknown_party=self.deals_skipped_unknown_party
             + other.deals_skipped_unknown_party,
             evidence_spans_added=self.evidence_spans_added + other.evidence_spans_added,
             errors=[*self.errors, *other.errors],
         )
-
-
-# ---------- Entity resolution ----------
-
-
-class EntityResolver:
-    """Case-insensitive name → :class:`Entity` lookup.
-
-    Built once per ingest run from the registry; cheap to query, no DB
-    round-trips after construction.
-    """
-
-    def __init__(self, entities: Iterable[Entity]) -> None:
-        self._by_name: dict[str, uuid.UUID] = {}
-        self._known_parties: list[KnownParty] = []
-        for entity in entities:
-            self._index(entity, entity.canonical_name)
-            for alias in entity.aliases:
-                self._index(entity, alias)
-            self._known_parties.append(
-                KnownParty(
-                    entity_id=entity.id,
-                    canonical_name=entity.canonical_name,
-                    aliases=list(entity.aliases),
-                ),
-            )
-
-    def _index(self, entity: Entity, key: str) -> None:
-        norm = key.strip().lower()
-        if not norm:
-            return
-        if norm in self._by_name and self._by_name[norm] != entity.id:
-            # Surface alias collisions loudly rather than silently winning.
-            log.warning(
-                "resolver.alias_collision",
-                key=key,
-                first_id=str(self._by_name[norm]),
-                second_id=str(entity.id),
-            )
-            return
-        self._by_name[norm] = entity.id
-
-    def resolve(self, name: str) -> uuid.UUID | None:
-        return self._by_name.get(name.strip().lower())
-
-    @property
-    def known_parties(self) -> list[KnownParty]:
-        return list(self._known_parties)
-
-    @classmethod
-    async def from_session(cls, session: AsyncSession) -> EntityResolver:
-        entities = await EntityRepository(session).list_all()
-        return cls(entities)
 
 
 # ---------- Core unit: one document -> deals ----------
@@ -198,8 +151,15 @@ async def ingest_raw_document(
     evidence_repo = EvidenceRepository(session)
 
     for ed in extracted:
-        from_id = resolver.resolve(ed.source_party_name)
-        to_id = resolver.resolve(ed.target_party_name)
+        # V1.8 open-world resolution: resolve_or_create auto-creates a
+        # discovered Entity row when a party isn't in the registry but
+        # passes the quality filter. Returns None only when the name is
+        # generic / unparseable ("we", "the Company", "bondholders").
+        before_known = len(resolver.known_parties)
+        from_id = await resolver.resolve_or_create(session, ed.source_party_name)
+        to_id = await resolver.resolve_or_create(session, ed.target_party_name)
+        stats.entities_discovered += len(resolver.known_parties) - before_known
+
         if from_id is None or to_id is None:
             stats.deals_skipped_unknown_party += 1
             log.debug(

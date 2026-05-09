@@ -26,6 +26,7 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlmodel import SQLModel, select
 
+from midas.entity_resolution import EntityResolver
 from midas.extractors.base import ExtractedDeal, ExtractionContext
 from midas.models import (
     Deal,
@@ -38,7 +39,6 @@ from midas.models import (
     SourceType,
 )
 from midas.pipeline import (
-    EntityResolver,
     IngestStats,
     ingest_raw_document,
     ingest_sec_filings_for_ticker,
@@ -213,12 +213,17 @@ async def test_ingest_raw_document_happy_path(session: AsyncSession) -> None:
     assert spans[0].source_id == sources[0].id
 
 
-async def test_ingest_raw_document_skips_unknown_party(session: AsyncSession) -> None:
+async def test_ingest_raw_document_skips_party_that_fails_quality_filter(
+    session: AsyncSession,
+) -> None:
+    """V1.8: a generic referent ("the Company") still gets dropped, with
+    deals_skipped_unknown_party incremented and no Entity row created.
+    """
     await _seed_two_entities(session)
     resolver = await EntityResolver.from_session(session)
     raw = _make_raw_document()
     extractor = _FakeExtractor(
-        [_make_extracted(source_party="Microsoft", target_party="Acme Holdings")],
+        [_make_extracted(source_party="Microsoft", target_party="the Company")],
     )
 
     stats = await ingest_raw_document(
@@ -230,8 +235,46 @@ async def test_ingest_raw_document_skips_unknown_party(session: AsyncSession) ->
 
     assert stats.deals_added == 0
     assert stats.deals_skipped_unknown_party == 1
+    assert stats.entities_discovered == 0
     assert stats.evidence_spans_added == 0
     assert (await session.execute(select(Deal))).scalars().first() is None
+    # And no discovered entity got created.
+    all_entities = await EntityRepository(session).list_all()
+    assert {e.canonical_name for e in all_entities} == {"Microsoft Corporation", "OpenAI"}
+
+
+async def test_ingest_raw_document_auto_creates_unknown_party(
+    session: AsyncSession,
+) -> None:
+    """V1.8: a real-looking party name auto-creates a discovered entity
+    instead of being dropped.
+    """
+    await _seed_two_entities(session)
+    resolver = await EntityResolver.from_session(session)
+    raw = _make_raw_document()
+    extractor = _FakeExtractor(
+        [_make_extracted(source_party="Microsoft", target_party="Constellation Energy")],
+    )
+
+    stats = await ingest_raw_document(
+        session=session,
+        raw=raw,
+        extractor=extractor,
+        resolver=resolver,
+    )
+
+    assert stats.deals_added == 1
+    assert stats.entities_discovered == 1
+    assert stats.deals_skipped_unknown_party == 0
+    assert stats.evidence_spans_added == 1
+
+    # The Deal points at the new discovered Entity.
+    deals = (await session.execute(select(Deal))).scalars().all()
+    assert len(deals) == 1
+    discovered = await EntityRepository(session).get(deals[0].to_entity_id)
+    assert discovered is not None
+    assert discovered.canonical_name == "Constellation Energy"
+    assert discovered.discovered is True
 
 
 async def test_ingest_raw_document_invokes_parser(session: AsyncSession) -> None:

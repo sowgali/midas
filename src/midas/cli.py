@@ -17,6 +17,7 @@ Commands:
 from __future__ import annotations
 
 import asyncio
+import uuid
 from datetime import date
 from pathlib import Path
 from typing import Annotated
@@ -92,6 +93,7 @@ def _print_stats(label: str, stats: IngestStats) -> None:
         f"sources(+/dup)={stats.sources_added}/{stats.sources_skipped_duplicate} "
         f"deals(+/merged/skip)="
         f"{stats.deals_added}/{stats.deals_merged}/{stats.deals_skipped_unknown_party} "
+        f"discovered={stats.entities_discovered} "
         f"evidence={stats.evidence_spans_added} "
         f"errors={len(stats.errors)}",
     )
@@ -309,6 +311,164 @@ async def _ingest_ir(
 
 
 # ---------- graph ----------
+
+
+review_app = typer.Typer(
+    help="Inspect / promote auto-discovered entities (V1.8 open-world resolution).",
+    no_args_is_help=True,
+)
+app.add_typer(review_app, name="review")
+
+
+@review_app.command("list")
+def review_list(
+    limit: Annotated[
+        int,
+        typer.Option(help="Max rows to print."),
+    ] = 50,
+) -> None:
+    """List discovered entities by deal-volume (most-flow first)."""
+    asyncio.run(_review_list(limit=limit))
+
+
+async def _review_list(*, limit: int) -> None:
+    from collections import Counter
+
+    from sqlmodel import col, select
+
+    from midas.models import Deal, Entity
+
+    engine = make_engine()
+    try:
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            discovered = (
+                (
+                    await session.execute(
+                        select(Entity).where(col(Entity.discovered).is_(True)),
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            # Pulling all deals and counting in Python is fine here: the
+            # whole point of this command is interactive review of a small
+            # set (tens — at most low hundreds — of pending entities).
+            deals = list((await session.execute(select(Deal))).scalars().all())
+            from_count: Counter[uuid.UUID] = Counter(d.from_entity_id for d in deals)
+            to_count: Counter[uuid.UUID] = Counter(d.to_entity_id for d in deals)
+
+            ranked = sorted(
+                discovered,
+                key=lambda e: from_count[e.id] + to_count[e.id],
+                reverse=True,
+            )
+            typer.echo(f"=== {len(ranked)} discovered entities ===")
+            if not ranked:
+                typer.echo("(none — registry is fully resolved)")
+                return
+            for ent in ranked[:limit]:
+                typer.echo(
+                    f"  {str(ent.id)[:8]}  "
+                    f"out={from_count[ent.id]:>3}  in={to_count[ent.id]:>3}  "
+                    f"{ent.canonical_name}",
+                )
+    finally:
+        await engine.dispose()
+
+
+@review_app.command("promote")
+def review_promote(
+    name_or_id: Annotated[str, typer.Argument(help="Canonical name or UUID prefix.")],
+    canonical: Annotated[
+        str | None,
+        typer.Option(help="Override the canonical name (e.g. fix capitalization)."),
+    ] = None,
+    ticker: Annotated[str | None, typer.Option(help="Set ticker.")] = None,
+    cik: Annotated[str | None, typer.Option(help="Set CIK (10-char zero-padded).")] = None,
+    sector: Annotated[
+        list[str] | None,
+        typer.Option("--sector", help="Replace sector_tags. Repeat for multiple."),
+    ] = None,
+    alias: Annotated[
+        list[str] | None,
+        typer.Option("--alias", help="Add aliases. Repeat for multiple."),
+    ] = None,
+) -> None:
+    """Promote a discovered entity to curated (sets ``discovered=False``)."""
+    asyncio.run(
+        _review_promote(
+            name_or_id=name_or_id,
+            canonical=canonical,
+            ticker=ticker,
+            cik=cik,
+            sectors=sector,
+            new_aliases=alias,
+        ),
+    )
+
+
+async def _review_promote(
+    *,
+    name_or_id: str,
+    canonical: str | None,
+    ticker: str | None,
+    cik: str | None,
+    sectors: list[str] | None,
+    new_aliases: list[str] | None,
+) -> None:
+    from sqlmodel import col, or_, select
+
+    from midas.models import Entity
+
+    engine = make_engine()
+    try:
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            # Match by id-prefix OR canonical_name OR alias-membership.
+            stmt = select(Entity).where(
+                or_(
+                    col(Entity.canonical_name) == name_or_id,
+                    col(Entity.canonical_name).ilike(name_or_id),
+                ),
+            )
+            ent = (await session.execute(stmt)).scalars().first()
+            if ent is None:
+                # Fall back to UUID-prefix scan over the discovered set.
+                discovered = (
+                    (
+                        await session.execute(
+                            select(Entity).where(col(Entity.discovered).is_(True)),
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                ent = next(
+                    (e for e in discovered if str(e.id).startswith(name_or_id.lower())),
+                    None,
+                )
+            if ent is None:
+                typer.echo(f"No entity matched {name_or_id!r}.", err=True)
+                raise typer.Exit(code=1)
+
+            ent.discovered = False
+            if canonical is not None:
+                ent.canonical_name = canonical
+            if ticker is not None:
+                ent.ticker = ticker
+            if cik is not None:
+                ent.cik = cik
+            if sectors is not None:
+                ent.sector_tags = list(sectors)
+            if new_aliases:
+                ent.aliases = sorted({*ent.aliases, *new_aliases})
+            session.add(ent)
+            await session.commit()
+            typer.echo(
+                f"Promoted: {ent.canonical_name} "
+                f"(ticker={ent.ticker} cik={ent.cik} sectors={ent.sector_tags})",
+            )
+    finally:
+        await engine.dispose()
 
 
 @app.command()

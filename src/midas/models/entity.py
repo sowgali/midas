@@ -11,7 +11,7 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 
-from sqlalchemy import Column, DateTime, Index, String, text
+from sqlalchemy import Boolean, Column, DateTime, Index, String, text
 from sqlmodel import Field, SQLModel
 
 from ._columns import JSON_VARIANT
@@ -46,6 +46,17 @@ class Entity(SQLModel, table=True):
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(UTC),
         sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
+
+    # V1.8 open-world entity resolution: True when this row was
+    # auto-created from an extraction whose party name didn't match any
+    # existing entity. Curated registry rows (seed.yaml, human-promoted
+    # via `midas review promote`) have ``discovered=False``. Frontends
+    # may render discovered entities differently to flag them as
+    # "needs human review".
+    discovered: bool = Field(
+        default=False,
+        sa_column=Column(Boolean(), nullable=False),
     )
 
     __table_args__ = (
