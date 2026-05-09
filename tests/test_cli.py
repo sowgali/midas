@@ -233,6 +233,40 @@ def test_graph_render_parses_args(runner: CliRunner, monkeypatch: Any, tmp_path:
     assert captured["title"] == "AI cash flow"
 
 
+# ---------- reconcile ----------
+
+
+def test_reconcile_dry_run_reports_plan(runner: CliRunner, monkeypatch: Any) -> None:
+    """`midas reconcile --dry-run` prints the plan and writes nothing."""
+    captured: dict[str, Any] = {}
+
+    async def fake_reconcile(*, dry_run: bool, verbose: bool) -> None:
+        captured["dry_run"] = dry_run
+        captured["verbose"] = verbose
+
+    monkeypatch.setattr("midas.cli._reconcile", fake_reconcile)
+
+    result = runner.invoke(app, ["reconcile", "--dry-run"])
+    assert result.exit_code == 0, result.stdout
+    assert captured["dry_run"] is True
+    assert captured["verbose"] is False
+
+
+def test_reconcile_apply_no_dry_run(runner: CliRunner, monkeypatch: Any) -> None:
+    captured: dict[str, Any] = {}
+
+    async def fake_reconcile(*, dry_run: bool, verbose: bool) -> None:
+        captured["dry_run"] = dry_run
+        captured["verbose"] = verbose
+
+    monkeypatch.setattr("midas.cli._reconcile", fake_reconcile)
+
+    result = runner.invoke(app, ["reconcile", "-v"])
+    assert result.exit_code == 0
+    assert captured["dry_run"] is False
+    assert captured["verbose"] is True
+
+
 def test_graph_render_defaults(runner: CliRunner, monkeypatch: Any) -> None:
     captured: dict[str, Any] = {}
 

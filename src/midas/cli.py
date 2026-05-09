@@ -211,6 +211,127 @@ async def _ingest_sec(
 # ---------- graph ----------
 
 
+@app.command()
+def reconcile(
+    dry_run: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run",
+            help="Show the plan but don't write changes.",
+        ),
+    ] = False,
+    verbose: Annotated[
+        bool,
+        typer.Option("--verbose", "-v", help="Print one line per merge."),
+    ] = False,
+) -> None:
+    """Find duplicate Deal rows and merge them per the V1.6 dedup policy.
+
+    Use this once to clean up data ingested before V1.6; the live
+    pipeline now dedups at ingest time.
+    """
+    asyncio.run(_reconcile(dry_run=dry_run, verbose=verbose))
+
+
+async def _reconcile(*, dry_run: bool, verbose: bool) -> None:
+    from sqlalchemy import update as sa_update
+    from sqlmodel import col, select
+
+    from midas.dedup import deals_match, merge_duplicate_into
+    from midas.models import Deal, EvidenceSpan
+    from midas.storage.repository import EntityRepository
+
+    engine = make_engine()
+    try:
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            entity_name = {
+                e.id: e.canonical_name for e in await EntityRepository(session).list_all()
+            }
+
+            deals = list(
+                (await session.execute(select(Deal).order_by(col(Deal.created_at))))
+                .scalars()
+                .all(),
+            )
+
+            absorbed: set[object] = set()
+            plan: list[tuple[Deal, Deal]] = []
+            for i, canonical in enumerate(deals):
+                if canonical.id in absorbed:
+                    continue
+                for later in deals[i + 1 :]:
+                    if later.id in absorbed:
+                        continue
+                    if deals_match(
+                        canonical,
+                        from_entity_id=later.from_entity_id,
+                        to_entity_id=later.to_entity_id,
+                        deal_type=later.deal_type,
+                        announced_at=later.announced_at,
+                        amount_usd=later.amount_usd,
+                    ):
+                        absorbed.add(later.id)
+                        plan.append((canonical, later))
+
+            typer.echo("=== Reconciliation plan ===")
+            typer.echo(
+                f"  {len(plan)} candidate merges; "
+                f"{len(deals)} -> {len(deals) - len(plan)} deals after apply",
+            )
+            if verbose and plan:
+                typer.echo("")
+                for canonical, dup in plan:
+                    fr = entity_name.get(canonical.from_entity_id, "?")
+                    to = entity_name.get(canonical.to_entity_id, "?")
+                    cf = _fmt_amount(canonical.amount_usd)
+                    df = _fmt_amount(dup.amount_usd)
+                    cd = canonical.announced_at or "—"
+                    dd = dup.announced_at or "—"
+                    typer.echo(f"  {fr} → {to} ({canonical.deal_type})")
+                    typer.echo(
+                        f"    canon  {canonical.id}  {cf}  {canonical.status}  {cd}",
+                    )
+                    typer.echo(
+                        f"    absorb {dup.id}  {df}  {dup.status}  {dd}",
+                    )
+
+            if dry_run:
+                typer.echo("\n(dry-run; no changes written. Re-run without --dry-run to apply.)")
+                return
+
+            if not plan:
+                typer.echo("Nothing to reconcile.")
+                return
+
+            for canonical, dup in plan:
+                merge_duplicate_into(canonical, dup)
+                session.add(canonical)
+                # Move all EvidenceSpans from the duplicate onto the canonical.
+                await session.execute(
+                    sa_update(EvidenceSpan)
+                    .where(col(EvidenceSpan.deal_id) == dup.id)
+                    .values(deal_id=canonical.id),
+                )
+                await session.delete(dup)
+
+            await session.commit()
+            typer.echo(f"\nApplied {len(plan)} merges.")
+    finally:
+        await engine.dispose()
+
+
+def _fmt_amount(amount: object) -> str:
+    """Render a Decimal/float amount as $1.5B / $500M / —."""
+    if amount is None:
+        return "—"
+    val = float(amount)  # type: ignore[arg-type]
+    if abs(val) >= 1e9:
+        return f"${val / 1e9:.1f}B"
+    if abs(val) >= 1e6:
+        return f"${val / 1e6:.0f}M"
+    return f"${val:,.0f}"
+
+
 @graph_app.command("render")
 def graph_render(
     sector: Annotated[

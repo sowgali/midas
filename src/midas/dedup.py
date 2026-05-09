@@ -240,3 +240,34 @@ def apply_merge(existing: Deal, candidate: ExtractedDeal) -> None:
     existing.confidence = max(existing.confidence, candidate.confidence)
     existing.description = merge_description(existing.description, candidate.description)
     existing.updated_at = datetime.now(UTC)
+
+
+def merge_duplicate_into(canonical: Deal, duplicate: Deal) -> None:
+    """Absorb ``duplicate`` Deal row into ``canonical``, in place.
+
+    Same field-merge rules as :func:`apply_merge` but operating on two
+    persisted :class:`Deal` rows instead of (Deal, ExtractedDeal). Used
+    by ``midas reconcile`` to collapse rows that pre-date V1.6 dedup.
+    Caller is responsible for migrating EvidenceSpans + deleting
+    ``duplicate``.
+    """
+    canonical.amount_usd = merge_amount(
+        canonical.amount_usd,
+        canonical.status,
+        duplicate.amount_usd,
+        duplicate.status,
+    )
+    canonical.amount_native = merge_amount(
+        canonical.amount_native,
+        canonical.status,
+        duplicate.amount_native,
+        duplicate.status,
+    )
+    if canonical.currency is None:
+        canonical.currency = duplicate.currency
+    canonical.announced_at = merge_announced_at(canonical.announced_at, duplicate.announced_at)
+    canonical.closes_at = merge_closes_at(canonical.closes_at, duplicate.closes_at)
+    canonical.status = merge_status(canonical.status, duplicate.status)
+    canonical.confidence = max(canonical.confidence, duplicate.confidence)
+    canonical.description = merge_description(canonical.description, duplicate.description)
+    canonical.updated_at = datetime.now(UTC)
