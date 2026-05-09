@@ -425,3 +425,191 @@ def test_resolver_returns_none_for_unknown_id_in_isolation() -> None:
     resolver = EntityResolver([])
     assert resolver.resolve("anything") is None
     assert resolver.known_parties == []
+
+
+# ---------- V1.6 dedup integration ----------
+
+
+async def test_pipeline_merges_redisclosure_into_existing_deal(
+    session: AsyncSession,
+) -> None:
+    """5 filings disclosing the same Wiz acquisition collapse to 1 Deal
+    + 5 EvidenceSpans. End-to-end test of the dedup pipeline path.
+    """
+    # Seed Alphabet + Wiz so the resolver can map party names.
+    repo = EntityRepository(session)
+    alphabet = Entity(
+        canonical_name="Alphabet Inc.",
+        aliases=["Google", "GOOGL"],
+        ticker="GOOGL",
+        cik="0001652044",
+        entity_type=EntityType.PUBLIC_COMPANY,
+        sector_tags=["ai"],
+    )
+    wiz = Entity(
+        canonical_name="Wiz, Inc.",
+        aliases=["Wiz"],
+        entity_type=EntityType.PRIVATE_COMPANY,
+        sector_tags=["ai"],
+    )
+    await repo.add(alphabet)
+    await repo.add(wiz)
+    await session.commit()
+    resolver = await EntityResolver.from_session(session)
+
+    def announce_row() -> ExtractedDeal:
+        return ExtractedDeal(
+            source_party_name="Alphabet Inc.",
+            target_party_name="Wiz, Inc.",
+            deal_type=DealType.ACQUISITION,
+            status=DealStatus.ANNOUNCED,
+            amount_usd=Decimal("32000000000"),
+            announced_at=date(2025, 3, 1),
+            confidence=0.97,
+            description="Alphabet entered into a definitive agreement to acquire Wiz.",
+            evidence_text_snippet="In March 2025, we entered into a definitive agreement to acquire Wiz.",
+            char_start=0,
+            char_end=70,
+            extractor_name="test:fake",
+        )
+
+    def close_row() -> ExtractedDeal:
+        return ExtractedDeal(
+            source_party_name="Alphabet Inc.",
+            target_party_name="Wiz, Inc.",
+            deal_type=DealType.ACQUISITION,
+            status=DealStatus.CLOSED,
+            amount_usd=Decimal("29500000000"),
+            announced_at=None,
+            closes_at=date(2026, 3, 11),
+            confidence=0.98,
+            description="Alphabet completed the acquisition of Wiz for $29.5 billion.",
+            evidence_text_snippet="On March 11, 2026, we completed our acquisition of Wiz for $29.5 billion.",
+            char_start=0,
+            char_end=80,
+            extractor_name="test:fake",
+        )
+
+    # Five filings: 4 announce-stage disclosures + 1 close-stage.
+    extracted_per_filing = [
+        [announce_row()],
+        [announce_row()],
+        [announce_row()],
+        [announce_row()],
+        [close_row()],
+    ]
+
+    total = IngestStats()
+    for i, extracted in enumerate(extracted_per_filing):
+        raw = RawDocument(
+            url=f"https://example.com/filing-{i}",
+            content_bytes=f"filing {i}".encode(),
+            source_type=SourceType.FORM_10Q if i < 4 else SourceType.FORM_10K,
+            publisher="SEC",
+            title=f"10-Q {i}" if i < 4 else "10-K",
+            published_at=datetime(2026, 3 + (i // 2), 1, tzinfo=UTC),
+        )
+        total += await ingest_raw_document(
+            session=session,
+            raw=raw,
+            extractor=_FakeExtractor(extracted),
+            resolver=resolver,
+        )
+
+    assert total.documents_seen == 5
+    assert total.deals_added == 1
+    assert total.deals_merged == 4
+    assert total.evidence_spans_added == 5
+
+    # One Deal row, with the close-stage values winning per the merge rules.
+    deals = (await session.execute(select(Deal))).scalars().all()
+    assert len(deals) == 1
+    deal = deals[0]
+    assert deal.status == DealStatus.CLOSED
+    assert deal.amount_usd == Decimal("29500000000")
+    assert deal.announced_at == date(2025, 3, 1)  # earliest preserved
+    assert deal.closes_at == date(2026, 3, 11)
+    assert deal.confidence == 0.98  # max
+    assert deal.updated_at >= deal.created_at
+
+    # Five EvidenceSpans, one per filing.
+    spans = (await session.execute(select(EvidenceSpan))).scalars().all()
+    assert len(spans) == 5
+    assert {s.deal_id for s in spans} == {deal.id}
+
+
+async def test_pipeline_does_not_merge_distinct_amounts(session: AsyncSession) -> None:
+    """The Waymo case: $16B external round and $5.6B VIE funding are
+    different deals (65% gap, way outside the 15% tolerance).
+    """
+    repo = EntityRepository(session)
+    alphabet = Entity(
+        canonical_name="Alphabet Inc.",
+        aliases=["Google"],
+        ticker="GOOGL",
+        cik="0001652044",
+        entity_type=EntityType.PUBLIC_COMPANY,
+        sector_tags=["ai"],
+    )
+    waymo = Entity(
+        canonical_name="Waymo",
+        aliases=["Waymo LLC"],
+        entity_type=EntityType.PRIVATE_COMPANY,
+        sector_tags=["ai"],
+    )
+    await repo.add(alphabet)
+    await repo.add(waymo)
+    await session.commit()
+    resolver = await EntityResolver.from_session(session)
+
+    def waymo_extracted(amount: Decimal) -> ExtractedDeal:
+        return ExtractedDeal(
+            source_party_name="Alphabet Inc.",
+            target_party_name="Waymo",
+            deal_type=DealType.INVESTMENT,
+            status=DealStatus.ANNOUNCED,
+            amount_usd=amount,
+            announced_at=date(2026, 2, 1),
+            confidence=0.9,
+            description=f"${int(amount):,} investment in Waymo.",
+            evidence_text_snippet="Waymo investment.",
+            char_start=0,
+            char_end=20,
+            extractor_name="test:fake",
+        )
+
+    raw_a = RawDocument(
+        url="https://example.com/a",
+        content_bytes=b"a",
+        source_type=SourceType.FORM_10Q,
+        publisher="SEC",
+        title="A",
+        published_at=datetime(2026, 3, 1, tzinfo=UTC),
+    )
+    raw_b = RawDocument(
+        url="https://example.com/b",
+        content_bytes=b"b",
+        source_type=SourceType.FORM_10Q,
+        publisher="SEC",
+        title="B",
+        published_at=datetime(2026, 4, 1, tzinfo=UTC),
+    )
+
+    await ingest_raw_document(
+        session=session,
+        raw=raw_a,
+        extractor=_FakeExtractor([waymo_extracted(Decimal("16000000000"))]),
+        resolver=resolver,
+    )
+    stats_b = await ingest_raw_document(
+        session=session,
+        raw=raw_b,
+        extractor=_FakeExtractor([waymo_extracted(Decimal("5600000000"))]),
+        resolver=resolver,
+    )
+
+    assert stats_b.deals_added == 1
+    assert stats_b.deals_merged == 0
+    deals = (await session.execute(select(Deal))).scalars().all()
+    assert len(deals) == 2
+    assert {d.amount_usd for d in deals} == {Decimal("16000000000"), Decimal("5600000000")}

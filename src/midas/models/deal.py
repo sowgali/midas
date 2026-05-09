@@ -65,6 +65,11 @@ class Deal(SQLModel, table=True):
         default_factory=lambda: datetime.now(UTC),
         sa_column=Column(DateTime(timezone=True), nullable=False),
     )
+    # Bumped whenever reconciliation merges new evidence into this row.
+    updated_at: datetime = Field(
+        default_factory=lambda: datetime.now(UTC),
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
 
     __table_args__ = (
         Index("ix_deal_from_announced", "from_entity_id", "announced_at"),

@@ -25,6 +25,7 @@ from datetime import date
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from midas.dedup import apply_merge, find_matching_deal
 from midas.extractors.base import ExtractedDeal, ExtractionContext, Extractor, KnownParty
 from midas.models import Deal, Entity, EvidenceSpan, Source
 from midas.parsers import Parser, select_parser
@@ -56,6 +57,7 @@ class IngestStats:
     sources_added: int = 0
     sources_skipped_duplicate: int = 0
     deals_added: int = 0
+    deals_merged: int = 0
     deals_skipped_unknown_party: int = 0
     evidence_spans_added: int = 0
     errors: list[str] = field(default_factory=list)
@@ -67,6 +69,7 @@ class IngestStats:
             sources_skipped_duplicate=self.sources_skipped_duplicate
             + other.sources_skipped_duplicate,
             deals_added=self.deals_added + other.deals_added,
+            deals_merged=self.deals_merged + other.deals_merged,
             deals_skipped_unknown_party=self.deals_skipped_unknown_party
             + other.deals_skipped_unknown_party,
             evidence_spans_added=self.evidence_spans_added + other.evidence_spans_added,
@@ -206,24 +209,50 @@ async def ingest_raw_document(
             )
             continue
 
-        deal = Deal(
+        # V1.6 dedup: do we already have this deal?
+        existing = await find_matching_deal(
+            session,
             from_entity_id=from_id,
             to_entity_id=to_id,
             deal_type=ed.deal_type,
-            amount_usd=ed.amount_usd,
-            amount_native=ed.amount_native,
-            currency=ed.currency,
             announced_at=ed.announced_at,
-            closes_at=ed.closes_at,
-            status=ed.status,
-            confidence=ed.confidence,
-            description=ed.description,
+            amount_usd=ed.amount_usd,
         )
-        await deal_repo.add(deal)
+
+        if existing is None:
+            deal = Deal(
+                from_entity_id=from_id,
+                to_entity_id=to_id,
+                deal_type=ed.deal_type,
+                amount_usd=ed.amount_usd,
+                amount_native=ed.amount_native,
+                currency=ed.currency,
+                announced_at=ed.announced_at,
+                closes_at=ed.closes_at,
+                status=ed.status,
+                confidence=ed.confidence,
+                description=ed.description,
+            )
+            await deal_repo.add(deal)
+            stats.deals_added += 1
+            target_deal_id = deal.id
+        else:
+            apply_merge(existing, ed)
+            session.add(existing)
+            await session.flush()
+            stats.deals_merged += 1
+            log.debug(
+                "pipeline.deal.merged",
+                deal_id=str(existing.id),
+                from_=ed.source_party_name,
+                to=ed.target_party_name,
+            )
+            target_deal_id = existing.id
+
         await evidence_repo.add_many(
             [
                 EvidenceSpan(
-                    deal_id=deal.id,
+                    deal_id=target_deal_id,
                     source_id=source.id,
                     text_snippet=ed.evidence_text_snippet,
                     char_start=ed.char_start,
@@ -232,7 +261,6 @@ async def ingest_raw_document(
                 ),
             ],
         )
-        stats.deals_added += 1
         stats.evidence_spans_added += 1
 
     await session.commit()

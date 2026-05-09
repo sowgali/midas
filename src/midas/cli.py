@@ -85,7 +85,8 @@ def _print_stats(label: str, stats: IngestStats) -> None:
     typer.echo(
         f"{label}: documents={stats.documents_seen} "
         f"sources(+/dup)={stats.sources_added}/{stats.sources_skipped_duplicate} "
-        f"deals(+/skip)={stats.deals_added}/{stats.deals_skipped_unknown_party} "
+        f"deals(+/merged/skip)="
+        f"{stats.deals_added}/{stats.deals_merged}/{stats.deals_skipped_unknown_party} "
         f"evidence={stats.evidence_spans_added} "
         f"errors={len(stats.errors)}",
     )

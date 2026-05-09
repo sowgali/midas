@@ -192,7 +192,7 @@ def test_print_stats_renders_counters(monkeypatch: Any, capsys: Any) -> None:
     _print_stats("test", stats)
     out = capsys.readouterr().out + capsys.readouterr().err
     assert "documents=2" in out
-    assert "deals(+/skip)=3/1" in out
+    assert "deals(+/merged/skip)=3/0/1" in out
 
 
 # ---------- graph render ----------
