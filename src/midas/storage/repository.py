@@ -55,6 +55,11 @@ class EntityRepository:
         result = await self._session.execute(stmt)
         return [e for e in result.scalars().all() if tag in e.sector_tags]
 
+    async def list_all(self) -> Sequence[Entity]:
+        stmt = select(Entity)
+        result = await self._session.execute(stmt)
+        return list(result.scalars().all())
+
 
 class SourceRepository:
     """Read/write access to :class:`Source` rows.
