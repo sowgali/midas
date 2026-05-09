@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from midas.extractors.base import ExtractedDeal, ExtractionContext, Extractor, KnownParty
 from midas.models import Deal, Entity, EvidenceSpan, Source
+from midas.parsers import Parser, select_parser
 from midas.sources.base import RawDocument
 from midas.sources.http_client import HttpClient
 from midas.sources.ir_press import IrPress, IrPressConfig
@@ -135,6 +136,7 @@ async def ingest_raw_document(
     raw: RawDocument,
     extractor: Extractor,
     resolver: EntityResolver,
+    parser: Parser | None = None,
 ) -> IngestStats:
     """Persist one fetched document end-to-end.
 
@@ -142,6 +144,12 @@ async def ingest_raw_document(
     the same document is ingested twice the second call is mostly a
     no-op for sources but will re-run extraction and re-insert deals.
     Deal-level dedup is deferred to V1.5.
+
+    The optional ``parser`` strips raw bytes (Inline XBRL, generic HTML)
+    down to clean prose before extraction. When omitted, the pipeline
+    picks one via :func:`midas.parsers.select_parser` based on
+    ``raw.source_type`` — XBRL parser for SEC forms, pass-through for
+    sources that already deliver UTF-8 prose.
 
     Commits on success.
     """
@@ -165,17 +173,22 @@ async def ingest_raw_document(
     else:
         stats.sources_skipped_duplicate += 1
 
-    # 2. Extract.
+    # 2. Parse: raw bytes -> clean prose. SEC iXBRL gets the XBRL strip
+    # treatment; press releases / RSS pass through (they're already prose).
+    active_parser = parser if parser is not None else select_parser(raw)
+    document_text = active_parser.parse(raw)
+
+    # 3. Extract.
     context = ExtractionContext(
         source_id=source.id,
         source_url=raw.url,
         source_type=raw.source_type,
         known_parties=resolver.known_parties,
-        document_text=raw.content_bytes.decode("utf-8", errors="replace"),
+        document_text=document_text,
     )
     extracted: list[ExtractedDeal] = await extractor.extract(context)
 
-    # 3. Resolve + persist.
+    # 4. Resolve + persist.
     deal_repo = DealRepository(session)
     evidence_repo = EvidenceRepository(session)
 

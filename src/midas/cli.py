@@ -144,7 +144,11 @@ def ingest_sec(
     ] = None,
     forms: Annotated[
         list[str],
-        typer.Option("--form", help="SEC form codes; repeat to select multiple."),
+        typer.Option(
+            "--form",
+            help="SEC form codes; repeat to select multiple. Default covers the three "
+            "earnings-bearing forms (10-K annual, 10-Q quarterly, 8-K material events).",
+        ),
     ] = ["10-K", "10-Q", "8-K"],  # noqa: B006 — typer reads list defaults this way
     extractor_name: Annotated[
         str,

@@ -234,6 +234,54 @@ async def test_ingest_raw_document_skips_unknown_party(session: AsyncSession) ->
     assert (await session.execute(select(Deal))).scalars().first() is None
 
 
+async def test_ingest_raw_document_invokes_parser(session: AsyncSession) -> None:
+    """The pipeline should send *parsed* text to the extractor, not raw bytes.
+
+    Pin this so a future refactor can't quietly drop the parsing step
+    and start feeding raw iXBRL HTML to Claude again.
+    """
+    await _seed_two_entities(session)
+    resolver = await EntityResolver.from_session(session)
+
+    # Mark the source as a SEC form so the registry routes to XbrlHtmlParser.
+    raw = RawDocument(
+        url="https://example.com/8k",
+        content_bytes=(
+            b"<html><body>"
+            b"<ix:hidden><xbrli:context id='c'>SECRET</xbrli:context></ix:hidden>"
+            b"<p>Microsoft will invest $10 billion in OpenAI.</p>"
+            b"</body></html>"
+        ),
+        source_type=SourceType.FORM_8K,
+        publisher="SEC",
+        title="Test 8-K",
+        published_at=datetime(2025, 9, 15, tzinfo=UTC),
+    )
+
+    captured_text: list[str] = []
+
+    class _RecordingExtractor:
+        name = "test:recording"
+
+        async def extract(self, ctx: ExtractionContext) -> list[ExtractedDeal]:
+            captured_text.append(ctx.document_text)
+            return []
+
+    await ingest_raw_document(
+        session=session,
+        raw=raw,
+        extractor=_RecordingExtractor(),
+        resolver=resolver,
+    )
+
+    assert len(captured_text) == 1
+    text = captured_text[0]
+    assert "Microsoft will invest $10 billion in OpenAI." in text
+    # XBRL noise stripped before reaching the extractor.
+    assert "SECRET" not in text
+    assert "xbrli" not in text.lower()
+
+
 async def test_ingest_raw_document_dedups_source_by_content_sha256(
     session: AsyncSession,
 ) -> None:
