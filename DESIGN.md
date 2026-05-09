@@ -60,7 +60,7 @@ midas/
 | `uv` | env + dependency management |
 | `ruff` | lint + format (replaces black/flake8/isort) |
 | `mypy` or `pyright` | type checking; pydantic gives us a lot for free |
-| `pytest` + `pytest-asyncio` + `pytest-vcr` | tests; VCR cassettes record HTTP for offline replay |
+| `pytest` + `pytest-asyncio` + `respx` | tests; `respx` mocks `httpx` for offline HTTP tests |
 | `typer` | CLI (`midas ingest sec --ticker MSFT`, `midas graph render`) |
 
 ---
@@ -81,7 +81,9 @@ Key insight: **don't scrape what we can fetch structurally.** Tier the sources:
 
 ```
 sources/
-├── base.py          # Source ABC: async fetch() → RawDocument(url, content, fetched_at, sha256)
+├── base.py          # Source ABC + RawDocument(url, content_bytes, content_sha256,
+│                   #                          fetched_at, source_type, publisher,
+│                   #                          title, published_at)
 ├── http_client.py   # shared httpx.AsyncClient w/ rate limiting, retries, on-disk cache
 ├── sec_edgar.py     # ticker → CIK → filings; XBRL + HTML
 ├── ir_press.py      # configurable per-company IR feed scrapers
@@ -95,10 +97,12 @@ sources/
   we're scraping many companies × many filings. The shared client owns the
   rate limiter (semaphore + token bucket) so concurrency stays inside SEC's
   ≤10 req/s envelope across all coroutines.
-- **Cache raw responses to disk** keyed by `sha256(url) + fetched_at`. Re-running
+- **Cache raw responses to disk** keyed by `sha256(url)`, with a sibling
+  `.meta.json` recording `fetched_at`, content type, and status. Re-running
   the pipeline should never re-hit the network unless explicitly asked.
 - **Rate-limit at the client layer**, not per-scraper. SEC requires ≤10 req/s
-  with a contact User-Agent — make that a config value.
+  with a contact User-Agent; we cap at **8 req/s by default**
+  (`MIDAS_HTTP_RATE_LIMIT_PER_SEC`) to leave headroom.
 - **`tenacity`** for retries with exponential backoff (its async API).
 - Use **`playwright`** only when forced to (most IR sites are static HTML).
 
@@ -183,14 +187,22 @@ Two complementary extractors:
   validated structured data, not free-form JSON to repair. With prompt caching
   on the schema + instructions, this gets cheap fast.
 
-The LLM call should:
+Concrete shape:
 
-1. Take a text chunk + the parties already identified in the document
-   (from headers/metadata).
-2. Return a list of `Deal` candidates **with the exact supporting
-   `text_snippet`**.
-3. Get post-validated: amount parses, parties resolve to known entities,
-   dates are sane.
+```python
+class Extractor(Protocol):
+    name: ClassVar[str]                       # e.g. "claude:opus-4-7", "regex"
+    async def extract(
+        self, context: ExtractionContext
+    ) -> list[ExtractedDeal]: ...
+```
+
+`ExtractionContext` carries `document_text`, `source_id` / `source_url` /
+`source_type`, and `known_parties` (canonical name + aliases per known
+entity). The extractor returns `ExtractedDeal`s with party names, an
+exact `evidence_text_snippet` + char offsets, a confidence in `[0, 1]`,
+and the `extractor_name` that produced it. Entity resolution (name →
+`Entity.id`) happens later in the pipeline, after extraction.
 
 **Entity resolution** ("Google" → Alphabet's `Entity` row) is its own concern.
 Start with a hand-curated alias table for the top ~50 companies and graduate
@@ -229,12 +241,18 @@ For the graph itself, resist Neo4j for V1:
   or Neo4j. Postgres stays as the source of truth either way.
 
 ```
-storage/
-├── db.py            # async engine, session factory, alembic migrations
-└── repository.py    # EntityRepo, DealRepo, SourceRepo (async)
+src/midas/storage/
+├── db.py            # async engine, session factory, session() ctxmgr
+└── repository.py    # EntityRepo, SourceRepo, DealRepo, EvidenceRepo (async)
 
-graph/
-├── builder.py       # SQL → networkx.MultiDiGraph
+alembic/             # migrations live at repo root, not under storage/
+├── env.py           # async migration env; imports models for autogenerate
+├── script.py.mako
+└── versions/
+    └── 0001_initial_schema.py
+
+src/midas/graph/
+├── builder.py       # SQL → networkx.MultiDiGraph (with as_of date filter)
 ├── queries.py       # "downstream of OpenAI", "all flows into NVDA"
 └── viz.py           # render to HTML
 ```
