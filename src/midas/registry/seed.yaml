@@ -1,0 +1,151 @@
+# V1 AI-sector entity registry.
+#
+# Top-of-pyramid hyperscalers + AI labs + chip suppliers + cloud-adjacent
+# infrastructure. Aliases must include any string the extractors will see in
+# real prose (press releases, earnings calls), since entity resolution is a
+# case-insensitive exact match against canonical_name + aliases.
+#
+# CIK is the SEC's central index key — required for SEC EDGAR fetches; only
+# present on US public companies. Format: 10-char zero-padded.
+
+entities:
+  # ---------- Hyperscalers ----------
+  - canonical_name: "Microsoft Corporation"
+    aliases: ["Microsoft", "Microsoft Corp", "MSFT"]
+    ticker: "MSFT"
+    cik: "0000789019"
+    entity_type: public_company
+    sector_tags: ["ai", "cloud", "software"]
+    country: "US"
+
+  - canonical_name: "Alphabet Inc."
+    aliases: ["Google", "Google LLC", "Alphabet", "GOOG", "GOOGL"]
+    ticker: "GOOGL"
+    cik: "0001652044"
+    entity_type: public_company
+    sector_tags: ["ai", "cloud", "advertising"]
+    country: "US"
+
+  - canonical_name: "Amazon.com, Inc."
+    aliases: ["Amazon", "AWS", "Amazon Web Services", "AMZN"]
+    ticker: "AMZN"
+    cik: "0001018724"
+    entity_type: public_company
+    sector_tags: ["ai", "cloud", "ecommerce"]
+    country: "US"
+
+  - canonical_name: "Meta Platforms, Inc."
+    aliases: ["Meta", "Facebook", "META", "FB"]
+    ticker: "META"
+    cik: "0001326801"
+    entity_type: public_company
+    sector_tags: ["ai", "advertising"]
+    country: "US"
+
+  # ---------- Pure-play AI labs ----------
+  - canonical_name: "OpenAI"
+    aliases: ["OpenAI Inc.", "OpenAI LLC", "OpenAI Global, LLC", "OpenAI Global"]
+    entity_type: private_company
+    sector_tags: ["ai"]
+    country: "US"
+
+  - canonical_name: "Anthropic"
+    aliases: ["Anthropic PBC", "Anthropic, PBC"]
+    entity_type: private_company
+    sector_tags: ["ai"]
+    country: "US"
+
+  - canonical_name: "Mistral AI"
+    aliases: ["Mistral"]
+    entity_type: private_company
+    sector_tags: ["ai"]
+    country: "FR"
+
+  - canonical_name: "xAI"
+    aliases: ["xAI Corp", "X.AI", "xAI Holdings"]
+    entity_type: private_company
+    sector_tags: ["ai"]
+    country: "US"
+
+  - canonical_name: "Cohere"
+    aliases: ["Cohere Inc.", "Cohere AI"]
+    entity_type: private_company
+    sector_tags: ["ai"]
+    country: "CA"
+
+  # ---------- Chip / hardware ----------
+  - canonical_name: "NVIDIA Corporation"
+    aliases: ["NVIDIA", "Nvidia", "NVDA"]
+    ticker: "NVDA"
+    cik: "0001045810"
+    entity_type: public_company
+    sector_tags: ["ai", "semiconductors"]
+    country: "US"
+
+  - canonical_name: "Advanced Micro Devices, Inc."
+    aliases: ["AMD", "Advanced Micro Devices"]
+    ticker: "AMD"
+    cik: "0000002488"
+    entity_type: public_company
+    sector_tags: ["ai", "semiconductors"]
+    country: "US"
+
+  - canonical_name: "Taiwan Semiconductor Manufacturing Company"
+    aliases: ["TSMC", "Taiwan Semiconductor", "TSM"]
+    ticker: "TSM"
+    cik: "0001046179"
+    entity_type: public_company
+    sector_tags: ["semiconductors"]
+    country: "TW"
+
+  - canonical_name: "Broadcom Inc."
+    aliases: ["Broadcom", "AVGO"]
+    ticker: "AVGO"
+    cik: "0001730168"
+    entity_type: public_company
+    sector_tags: ["ai", "semiconductors"]
+    country: "US"
+
+  # ---------- Cloud-adjacent / data ----------
+  - canonical_name: "Oracle Corporation"
+    aliases: ["Oracle", "ORCL"]
+    ticker: "ORCL"
+    cik: "0001341439"
+    entity_type: public_company
+    sector_tags: ["ai", "cloud", "software"]
+    country: "US"
+
+  - canonical_name: "Salesforce, Inc."
+    aliases: ["Salesforce", "CRM"]
+    ticker: "CRM"
+    cik: "0001108524"
+    entity_type: public_company
+    sector_tags: ["ai", "software"]
+    country: "US"
+
+  - canonical_name: "Databricks"
+    aliases: ["Databricks Inc."]
+    entity_type: private_company
+    sector_tags: ["ai", "data"]
+    country: "US"
+
+  # ---------- AI-tooling / services ----------
+  - canonical_name: "Hugging Face"
+    aliases: ["HuggingFace", "Hugging Face Inc."]
+    entity_type: private_company
+    sector_tags: ["ai"]
+    country: "US"
+
+  - canonical_name: "Scale AI"
+    aliases: ["Scale", "Scale AI Inc."]
+    entity_type: private_company
+    sector_tags: ["ai"]
+    country: "US"
+
+  - canonical_name: "CoreWeave, Inc."
+    aliases: ["CoreWeave", "CRWV"]
+    ticker: "CRWV"
+    cik: "0001769628"
+    entity_type: public_company
+    sector_tags: ["ai", "cloud"]
+    country: "US"
