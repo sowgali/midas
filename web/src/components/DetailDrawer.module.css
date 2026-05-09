@@ -1,0 +1,277 @@
+.drawer {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.empty {
+  padding: 1.5rem 1rem;
+  color: #6b7280;
+  font-size: 0.85rem;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid #e5e7eb;
+  background: #ffffff;
+}
+
+.heading {
+  margin: 0;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #6b7280;
+  font-weight: 600;
+}
+
+.closeBtn {
+  background: transparent;
+  border: none;
+  font-size: 1.4rem;
+  line-height: 1;
+  color: #6b7280;
+  padding: 0 0.25rem;
+}
+
+.closeBtn:hover {
+  color: #111827;
+}
+
+.section {
+  padding: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+  overflow-y: auto;
+}
+
+.entityHeader {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+}
+
+.bigDot {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.entityName {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 600;
+  color: #111827;
+}
+
+.ticker {
+  display: inline-block;
+  margin-top: 0.15rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.72rem;
+  color: #6b7280;
+  background: #f3f4f6;
+  padding: 0.05rem 0.35rem;
+  border-radius: 3px;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.fieldLabel {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #6b7280;
+  font-weight: 600;
+}
+
+.fieldValue {
+  font-size: 0.88rem;
+  color: #111827;
+}
+
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+}
+
+.chip {
+  font-size: 0.75rem;
+  padding: 0.1rem 0.45rem;
+  background: #eef2ff;
+  color: #3730a3;
+  border-radius: 999px;
+}
+
+.pairHeader {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+  font-size: 0.92rem;
+  font-weight: 500;
+  color: #111827;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid #e5e7eb;
+}
+
+.pairArrow {
+  color: #6b7280;
+}
+
+.pairName {
+  word-break: break-word;
+}
+
+.muted {
+  color: #6b7280;
+  font-size: 0.85rem;
+  margin: 0;
+}
+
+.error {
+  color: #b91c1c;
+  font-size: 0.85rem;
+  margin: 0;
+}
+
+.dealList {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+}
+
+.dealCard {
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  padding: 0.7rem 0.8rem;
+  background: #ffffff;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.dealRow {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.dealType {
+  font-weight: 600;
+  font-size: 0.88rem;
+  color: #111827;
+  text-transform: capitalize;
+}
+
+.dealAmount {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.88rem;
+  color: #111827;
+}
+
+.dealMetaRow {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.75rem;
+  color: #6b7280;
+  text-transform: capitalize;
+}
+
+.dealDescription {
+  margin: 0;
+  font-size: 0.83rem;
+  color: #374151;
+  line-height: 1.4;
+}
+
+.confidence {
+  position: relative;
+  height: 8px;
+  background: #f3f4f6;
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.confidenceFill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  background: linear-gradient(90deg, #2563eb, #16a34a);
+  border-radius: 4px;
+}
+
+.confidenceLabel {
+  position: absolute;
+  right: 4px;
+  top: -16px;
+  font-size: 0.7rem;
+  color: #6b7280;
+}
+
+.expandBtn {
+  align-self: flex-start;
+  background: transparent;
+  border: none;
+  padding: 0;
+  font-size: 0.78rem;
+  color: #2563eb;
+}
+
+.expandBtn:hover {
+  text-decoration: underline;
+}
+
+.evidenceList {
+  list-style: none;
+  margin: 0.4rem 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.evidenceItem {
+  border-left: 3px solid #2563eb;
+  background: #f8fafc;
+  padding: 0.5rem 0.7rem;
+  border-radius: 0 4px 4px 0;
+}
+
+.snippet {
+  margin: 0 0 0.35rem;
+  font-size: 0.88rem;
+  color: #1f2937;
+  font-style: italic;
+  line-height: 1.5;
+}
+
+.evidenceMeta {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+}
+
+.sourceLink {
+  font-size: 0.8rem;
+  font-weight: 500;
+  color: #2563eb;
+  word-break: break-word;
+}
+
+.evidenceMetaSub {
+  font-size: 0.72rem;
+  color: #6b7280;
+}
