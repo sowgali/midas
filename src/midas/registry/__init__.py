@@ -2,6 +2,7 @@
 
 from .ir_loader import (
     IrPressSourceConfig,
+    PlaywrightSourceConfig,
     RssSourceConfig,
     default_ir_sources_path,
     parse_ir_sources,
@@ -10,6 +11,7 @@ from .loader import default_seed_path, load_seed_registry, parse_seed
 
 __all__ = [
     "IrPressSourceConfig",
+    "PlaywrightSourceConfig",
     "RssSourceConfig",
     "default_ir_sources_path",
     "default_seed_path",

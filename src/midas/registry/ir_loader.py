@@ -59,8 +59,29 @@ class IrPressSourceConfig(_BaseIrSource):
     source_type: SourceType = SourceType.PRESS_RELEASE
 
 
+class PlaywrightSourceConfig(_BaseIrSource):
+    """A headless-browser scraper for Cloudflare / JS-rendered sites.
+
+    Mirrors :class:`midas.sources.playwright_source.PlaywrightSourceConfig`
+    minus ``entity_id``. Used for OpenAI / Anthropic news where ``rss``
+    and ``ir_press`` both fail (Cloudflare TLS check + JS rendering).
+    """
+
+    type: Literal["playwright"]
+    index_url: str
+    item_selector: str
+    title_selector: str | None = None
+    date_selector: str | None = None
+    date_format: str | None = None
+    article_body_selector: str
+    link_base_url: str | None = None
+    wait_after_load_ms: int = 2500
+    navigation_timeout_ms: int = 30_000
+    source_type: SourceType = SourceType.BLOG
+
+
 IrSourceConfig = Annotated[
-    RssSourceConfig | IrPressSourceConfig,
+    RssSourceConfig | IrPressSourceConfig | PlaywrightSourceConfig,
     Discriminator("type"),
 ]
 _IrSourceListAdapter: TypeAdapter[list[IrSourceConfig]] = TypeAdapter(list[IrSourceConfig])
@@ -80,7 +101,7 @@ def default_ir_sources_path() -> Path:
 
 def parse_ir_sources(
     path: Path | None = None,
-) -> list[RssSourceConfig | IrPressSourceConfig]:
+) -> list[RssSourceConfig | IrPressSourceConfig | PlaywrightSourceConfig]:
     """Read and validate the IR YAML.
 
     Pydantic discriminator-based validation rejects unknown ``type``

@@ -14,6 +14,7 @@ import yaml
 
 from midas.registry import (
     IrPressSourceConfig,
+    PlaywrightSourceConfig,
     RssSourceConfig,
     parse_ir_sources,
     parse_seed,
@@ -22,9 +23,9 @@ from midas.registry import (
 
 def test_default_ir_sources_yaml_validates() -> None:
     sources = parse_ir_sources()
-    assert len(sources) >= 5  # We ship ~7 RSS feeds at V1.7.
+    assert len(sources) >= 5  # ~7 RSS + 2 Playwright at V1.9.
     for cfg in sources:
-        assert isinstance(cfg, RssSourceConfig | IrPressSourceConfig)
+        assert isinstance(cfg, RssSourceConfig | IrPressSourceConfig | PlaywrightSourceConfig)
 
 
 def test_every_ir_source_resolves_to_a_seeded_entity() -> None:

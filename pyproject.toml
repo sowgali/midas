@@ -21,6 +21,10 @@ dependencies = [
     "tenacity>=9.0",
     "selectolax>=0.3.21",
     "feedparser>=6.0",
+    # Headless browser (for Cloudflare-fronted + JS-rendered sources
+    # like OpenAI / Anthropic news). Pulls a Chromium binary; install via
+    # `uv run playwright install chromium` after `uv sync`.
+    "playwright>=1.50",
     # Extraction
     "anthropic>=0.40",
     # Graph

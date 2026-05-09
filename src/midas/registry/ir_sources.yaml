@@ -39,13 +39,34 @@ sources:
     publisher: "Meta Newsroom"
     source_type: news
 
-  # ---------- Private AI labs (no SEC; this is the only path) ----------
-  # TODO OpenAI: RSS exists at https://openai.com/news/rss but Cloudflare
-  # blocks GET requests with HTTP-client fingerprints (browser-like UAs
-  # also rejected — JA3/TLS fingerprinting). Needs Playwright (V1.8).
-  #
-  # TODO Anthropic: no public RSS feed; news page is JS-rendered.
-  # Same Playwright fix would unlock both.
+  # ---------- Private AI labs (V1.9 Playwright path) ----------
+  # Both OpenAI and Anthropic defeat the lightweight RSS/IR-press paths
+  # (Cloudflare TLS fingerprinting + JS-rendered cards). The playwright
+  # source spins up real Chromium per ingest run.
+
+  - entity_canonical_name: "OpenAI"
+    type: playwright
+    index_url: "https://openai.com/news/"
+    publisher: "OpenAI News"
+    source_type: blog
+    # Each article card is wrapped in an anchor pointing at /index/SLUG.
+    # Filter to that prefix to skip the category-link sidebar (which uses
+    # /news/<category>/ paths instead).
+    item_selector: "a[href^='/index/']"
+    article_body_selector: "main"
+    link_base_url: "https://openai.com"
+
+  - entity_canonical_name: "Anthropic"
+    type: playwright
+    index_url: "https://www.anthropic.com/news"
+    publisher: "Anthropic Newsroom"
+    source_type: blog
+    # Article cards use /news/<slug>; the small set of /news/<category>
+    # paths in the same selector are filterable by counting slashes if
+    # they show up — for now the slug pattern is unambiguous enough.
+    item_selector: "main a[href^='/news/']"
+    article_body_selector: "article"
+    link_base_url: "https://www.anthropic.com"
 
   # ---------- Chips / hardware ----------
   - entity_canonical_name: "NVIDIA Corporation"

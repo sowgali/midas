@@ -30,7 +30,15 @@ from midas import __version__
 from midas.extractors.base import Extractor
 from midas.graph.builder import build_graph
 from midas.graph.viz import render_pyvis
-from midas.pipeline import IngestStats, ingest_rss_feed, ingest_sec_filings_for_ticker
+from midas.pipeline import (
+    IngestStats,
+    ingest_playwright_source,
+    ingest_rss_feed,
+    ingest_sec_filings_for_ticker,
+)
+from midas.registry import (
+    PlaywrightSourceConfig as YamlPlaywrightSourceConfig,
+)
 from midas.registry import (
     RssSourceConfig,
     load_seed_registry,
@@ -38,6 +46,7 @@ from midas.registry import (
 )
 from midas.sources.http_client import HttpClient
 from midas.sources.ir_press import IrPressConfig
+from midas.sources.playwright_source import PlaywrightSourceConfig
 from midas.storage.db import make_engine
 
 log = structlog.get_logger(__name__)
@@ -281,6 +290,27 @@ async def _ingest_ir(
                         feed_url=cfg.feed_url,
                         publisher=cfg.publisher,
                         source_type=cfg.source_type,
+                        since=since,
+                    )
+                elif isinstance(cfg, YamlPlaywrightSourceConfig):
+                    pw_config = PlaywrightSourceConfig(
+                        entity_id=entity_id,
+                        publisher=cfg.publisher,
+                        index_url=cfg.index_url,
+                        item_selector=cfg.item_selector,
+                        title_selector=cfg.title_selector,
+                        date_selector=cfg.date_selector,
+                        date_format=cfg.date_format,
+                        article_body_selector=cfg.article_body_selector,
+                        link_base_url=cfg.link_base_url,
+                        wait_after_load_ms=cfg.wait_after_load_ms,
+                        navigation_timeout_ms=cfg.navigation_timeout_ms,
+                        source_type=cfg.source_type,
+                    )
+                    stats = await ingest_playwright_source(
+                        session=session,
+                        extractor=extractor,
+                        config=pw_config,
                         since=since,
                     )
                 else:  # IrPressSourceConfig

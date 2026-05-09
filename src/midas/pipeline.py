@@ -35,6 +35,7 @@ from midas.sources.base import RawDocument
 from midas.sources.blog_rss import RssFeed
 from midas.sources.http_client import HttpClient
 from midas.sources.ir_press import IrPress, IrPressConfig
+from midas.sources.playwright_source import PlaywrightSource, PlaywrightSourceConfig
 from midas.sources.sec_edgar import SecEdgar
 from midas.storage.repository import (
     DealRepository,
@@ -371,5 +372,66 @@ async def ingest_rss_feed(
             raw=raw,
             extractor=extractor,
             resolver=resolver,
+        )
+    return total
+
+
+async def ingest_playwright_source(
+    *,
+    session: AsyncSession,
+    extractor: Extractor,
+    config: PlaywrightSourceConfig,
+    since: date | None = None,
+) -> IngestStats:
+    """Fetch + ingest one Playwright-backed source (Cloudflare / JS-rendered).
+
+    Used for OpenAI / Anthropic news where the RSS / IR-press paths
+    don't work. Spins up one Chromium for the entire feed; that's the
+    expensive bit, so don't fan out per-item.
+    """
+    resolver = await EntityResolver.from_session(session)
+    total = IngestStats()
+    try:
+        async with PlaywrightSource(config) as source:
+            try:
+                items = await source.list_items(since=since)
+            except Exception as exc:
+                log.warning(
+                    "pipeline.playwright.list_items_failed",
+                    index_url=config.index_url,
+                    error=str(exc),
+                )
+                return IngestStats(
+                    errors=[
+                        f"{config.publisher}/{config.index_url}: list_items failed: {exc}",
+                    ],
+                )
+
+            for item in items:
+                try:
+                    raw = await source.fetch_article(item)
+                except Exception as exc:
+                    total.errors.append(f"{config.publisher}/{item.url}: {exc}")
+                    log.warning(
+                        "pipeline.playwright.fetch_failed",
+                        url=item.url,
+                        error=str(exc),
+                    )
+                    continue
+                total += await ingest_raw_document(
+                    session=session,
+                    raw=raw,
+                    extractor=extractor,
+                    resolver=resolver,
+                )
+    except Exception as exc:
+        # Browser launch failure (Chromium missing, OS error).
+        log.warning(
+            "pipeline.playwright.browser_failed",
+            index_url=config.index_url,
+            error=str(exc),
+        )
+        total.errors.append(
+            f"{config.publisher}/{config.index_url}: browser unavailable: {exc}",
         )
     return total
