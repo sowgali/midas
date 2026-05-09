@@ -66,7 +66,12 @@ class ExtractedDeal(BaseModel):
     target_party_name: str
 
     deal_type: DealType
-    status: DealStatus
+    # Default ANNOUNCED — when an 8-K / press release reports a deal,
+    # "announced" is by far the most common state at the moment of
+    # publication. Extractors / callers should override when the source
+    # text indicates otherwise (e.g. "the acquisition closed last
+    # quarter" → CLOSED).
+    status: DealStatus = DealStatus.ANNOUNCED
 
     amount_usd: Decimal | None = None
     amount_native: Decimal | None = None

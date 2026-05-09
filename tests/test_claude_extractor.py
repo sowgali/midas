@@ -7,7 +7,9 @@ never make real API calls. The tests pin down:
 * the multi-call path — multiple tool_use blocks all surface
 * the no-claim path — text-only responses return []
 * the missing-API-key path — RuntimeError with the right message
-* the validation path — bad model output raises ValidationError
+* the validation path — bad tool_use is logged + skipped, valid
+  siblings in the same response still surface
+* the default-status path — model omitting status defaults to ANNOUNCED
 """
 
 from __future__ import annotations
@@ -18,7 +20,6 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from pydantic import ValidationError
 
 from midas.extractors import ClaudeExtractor, ExtractionContext, KnownParty
 from midas.models.types import SourceType
@@ -187,9 +188,10 @@ async def test_missing_api_key_with_no_injected_client_raises() -> None:
 
 
 @pytest.mark.asyncio
-async def test_invalid_tool_input_raises_validation_error() -> None:
-    # Decision: validation errors propagate. We'd rather a noisy crash
-    # at the extractor boundary than silently dropped Deals downstream.
+async def test_invalid_tool_input_logged_and_skipped() -> None:
+    # Decision: per-tool_use validation failures don't tank the whole
+    # document. The bad block is dropped (and logged); valid neighbors
+    # in the same response still come through.
     bad_payload = {
         "source_party_name": "Microsoft Corporation",
         "target_party_name": "OpenAI",
@@ -206,11 +208,57 @@ async def test_invalid_tool_input_raises_validation_error() -> None:
         "char_start": 0,
         "char_end": 44,
     }
-    client = _mock_client_returning([_tool_use_block("record_deal", bad_payload)])
+    good_payload = {
+        "source_party_name": "Anthropic",
+        "target_party_name": "Amazon.com, Inc.",
+        "deal_type": "investment",
+        "status": "announced",
+        "amount_usd": 4000000000,
+        "amount_native": None,
+        "currency": "USD",
+        "announced_at": None,
+        "closes_at": None,
+        "confidence": 0.95,
+        "description": "Amazon invests in Anthropic",
+        "evidence_text_snippet": "Amazon to invest up to $4 billion in Anthropic.",
+        "char_start": 100,
+        "char_end": 146,
+    }
+    client = _mock_client_returning(
+        [
+            _tool_use_block("record_deal", bad_payload),
+            _tool_use_block("record_deal", good_payload),
+        ],
+    )
     extractor = ClaudeExtractor(client=client)
 
-    with pytest.raises(ValidationError):
-        await extractor.extract(_ctx())
+    deals = await extractor.extract(_ctx())
+    assert len(deals) == 1
+    assert deals[0].source_party_name == "Anthropic"
+
+
+@pytest.mark.asyncio
+async def test_status_defaults_when_omitted_by_model() -> None:
+    """Real-world Claude responses sometimes omit ``status`` — the model
+    defaults to ``ANNOUNCED`` (matches the dominant 8-K case).
+    """
+    payload_no_status = {
+        "source_party_name": "Microsoft Corporation",
+        "target_party_name": "OpenAI",
+        "deal_type": "investment",
+        "amount_usd": 10000000000,
+        "currency": "USD",
+        "confidence": 0.9,
+        "description": "Microsoft → OpenAI",
+        "evidence_text_snippet": "Microsoft invests $10B in OpenAI.",
+        "char_start": 0,
+        "char_end": 33,
+    }
+    client = _mock_client_returning([_tool_use_block("record_deal", payload_no_status)])
+    extractor = ClaudeExtractor(client=client)
+    deals = await extractor.extract(_ctx())
+    assert len(deals) == 1
+    assert deals[0].status.value == "announced"
 
 
 @pytest.mark.asyncio

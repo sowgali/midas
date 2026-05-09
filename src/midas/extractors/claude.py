@@ -27,11 +27,14 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 import anthropic
+import structlog
 from pydantic import ValidationError
 
 from midas.config import settings
 
 from .base import ExtractedDeal, ExtractionContext, KnownParty
+
+log = structlog.get_logger(__name__)
 
 if TYPE_CHECKING:
     from anthropic.types import ToolUseBlock
@@ -136,7 +139,10 @@ _RECORD_DEAL_SCHEMA: dict[str, Any] = {
         "source_party_name",
         "target_party_name",
         "deal_type",
-        "status",
+        # status is intentionally NOT required — pydantic defaults to
+        # ANNOUNCED, which matches the dominant case for 8-K / press
+        # release sources where the deal is being announced as the
+        # filing is published.
         "confidence",
         "description",
         "evidence_text_snippet",
@@ -251,11 +257,16 @@ class ClaudeExtractor:
             payload["extractor_name"] = self.name
             try:
                 deals.append(ExtractedDeal.model_validate(payload))
-            except ValidationError:
-                # Decision: surface validation errors. Silently dropping
-                # would mask schema drift between this code and the
-                # tool definition; the pipeline already logs and skips
-                # bad rows at the next layer up.
-                raise
+            except ValidationError as exc:
+                # One bad tool_use shouldn't tank the whole document —
+                # extractors are best-effort. Log enough to surface
+                # systematic schema drift later without blocking the
+                # rest of the deals the model recovered.
+                log.warning(
+                    "claude.invalid_tool_use",
+                    error=str(exc),
+                    payload_keys=sorted(payload.keys()),
+                )
+                continue
 
         return deals
