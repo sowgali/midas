@@ -149,3 +149,26 @@ entities:
     entity_type: public_company
     sector_tags: ["ai", "cloud"]
     country: "US"
+
+  # ---------- Recent acquisition / investment targets (V1.5) ----------
+  # These appear as deal targets in 2025 filings of the hyperscalers; the
+  # V1 registry only seeded payers. Add them so the resolver can land
+  # edges instead of skipping every M&A target with "unknown party".
+
+  - canonical_name: "Wiz, Inc."
+    aliases: ["Wiz"]
+    entity_type: private_company
+    sector_tags: ["ai", "cybersecurity"]
+    country: "US"
+
+  - canonical_name: "Waymo"
+    aliases: ["Waymo LLC"]
+    entity_type: private_company
+    sector_tags: ["ai", "autonomous-vehicles"]
+    country: "US"
+
+  - canonical_name: "Character Technologies"
+    aliases: ["character.ai", "Character.AI", "Character AI", "Character.ai"]
+    entity_type: private_company
+    sector_tags: ["ai"]
+    country: "US"
