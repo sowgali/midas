@@ -28,8 +28,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from midas.dedup import apply_merge, find_matching_deal
 from midas.extractors.base import ExtractedDeal, ExtractionContext, Extractor, KnownParty
 from midas.models import Deal, Entity, EvidenceSpan, Source
+from midas.models.types import SourceType
 from midas.parsers import Parser, select_parser
 from midas.sources.base import RawDocument
+from midas.sources.blog_rss import RssFeed
 from midas.sources.http_client import HttpClient
 from midas.sources.ir_press import IrPress, IrPressConfig
 from midas.sources.sec_edgar import SecEdgar
@@ -331,6 +333,51 @@ async def ingest_ir_press(
             raw = await press.fetch_article(item)
         except Exception as exc:
             total.errors.append(f"{config.publisher}/{item.url}: {exc}")
+            continue
+        total += await ingest_raw_document(
+            session=session,
+            raw=raw,
+            extractor=extractor,
+            resolver=resolver,
+        )
+    return total
+
+
+async def ingest_rss_feed(
+    *,
+    session: AsyncSession,
+    http_client: HttpClient,
+    extractor: Extractor,
+    entity_id: uuid.UUID,
+    feed_url: str,
+    publisher: str,
+    source_type: SourceType = SourceType.BLOG,
+    since: date | None = None,
+) -> IngestStats:
+    """Fetch + ingest one company's RSS / Atom feed.
+
+    Mirrors :func:`ingest_ir_press` but for the RSS path. Body
+    extraction is the generic "drop-script-find-article" fallback
+    inside :class:`RssFeed`; configurable per-site selectors live on
+    the IR-press path.
+    """
+    feed = RssFeed(
+        entity_id=entity_id,
+        feed_url=feed_url,
+        publisher=publisher,
+        source_type=source_type,
+        http_client=http_client,
+    )
+    items = await feed.list_items(since=since)
+    resolver = await EntityResolver.from_session(session)
+
+    total = IngestStats()
+    for item in items:
+        try:
+            raw = await feed.fetch_article(item)
+        except Exception as exc:
+            total.errors.append(f"{publisher}/{item.url}: {exc}")
+            log.warning("pipeline.rss.fetch_failed", url=item.url, error=str(exc))
             continue
         total += await ingest_raw_document(
             session=session,

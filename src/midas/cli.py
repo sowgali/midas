@@ -29,9 +29,14 @@ from midas import __version__
 from midas.extractors.base import Extractor
 from midas.graph.builder import build_graph
 from midas.graph.viz import render_pyvis
-from midas.pipeline import IngestStats, ingest_sec_filings_for_ticker
-from midas.registry import load_seed_registry
+from midas.pipeline import IngestStats, ingest_rss_feed, ingest_sec_filings_for_ticker
+from midas.registry import (
+    RssSourceConfig,
+    load_seed_registry,
+    parse_ir_sources,
+)
 from midas.sources.http_client import HttpClient
+from midas.sources.ir_press import IrPressConfig
 from midas.storage.db import make_engine
 
 log = structlog.get_logger(__name__)
@@ -204,6 +209,101 @@ async def _ingest_sec(
                 since=since,
             )
         _print_stats(f"SEC/{ticker}", stats)
+    finally:
+        await engine.dispose()
+
+
+@ingest_app.command("ir")
+def ingest_ir(
+    entity: Annotated[
+        str | None,
+        typer.Option(help="Canonical entity name; default = every configured source."),
+    ] = None,
+    since: Annotated[
+        str | None,
+        typer.Option(help="ISO date — only ingest items published on/after this."),
+    ] = None,
+    extractor_name: Annotated[
+        str,
+        typer.Option("--extractor", help="Extractor: 'regex' (default, free) or 'claude'."),
+    ] = "regex",
+) -> None:
+    """Fetch IR / news / blog feeds, extract deals, persist."""
+    since_date = date.fromisoformat(since) if since else None
+    extractor = _build_extractor(extractor_name)
+    asyncio.run(_ingest_ir(entity, since_date, extractor))
+
+
+async def _ingest_ir(
+    entity_filter: str | None,
+    since: date | None,
+    extractor: Extractor,
+) -> None:
+    from midas.pipeline import ingest_ir_press
+    from midas.storage.repository import EntityRepository
+
+    configs = parse_ir_sources()
+    if entity_filter is not None:
+        configs = [c for c in configs if c.entity_canonical_name.lower() == entity_filter.lower()]
+        if not configs:
+            typer.echo(f"No IR sources configured for {entity_filter!r}.")
+            raise typer.Exit(code=1)
+
+    engine = make_engine()
+    try:
+        async with (
+            HttpClient() as http_client,
+            AsyncSession(engine, expire_on_commit=False) as session,
+        ):
+            entity_map = {
+                e.canonical_name: e.id for e in await EntityRepository(session).list_all()
+            }
+
+            total = IngestStats()
+            for cfg in configs:
+                entity_id = entity_map.get(cfg.entity_canonical_name)
+                if entity_id is None:
+                    typer.echo(
+                        f"  ! unknown entity {cfg.entity_canonical_name!r} — "
+                        "run `midas init --seed-only` first.",
+                        err=True,
+                    )
+                    continue
+
+                if isinstance(cfg, RssSourceConfig):
+                    stats = await ingest_rss_feed(
+                        session=session,
+                        http_client=http_client,
+                        extractor=extractor,
+                        entity_id=entity_id,
+                        feed_url=cfg.feed_url,
+                        publisher=cfg.publisher,
+                        source_type=cfg.source_type,
+                        since=since,
+                    )
+                else:  # IrPressSourceConfig
+                    ir_config = IrPressConfig(
+                        entity_id=entity_id,
+                        publisher=cfg.publisher,
+                        index_url=cfg.index_url,
+                        item_selector=cfg.item_selector,
+                        link_selector=cfg.link_selector,
+                        title_selector=cfg.title_selector,
+                        date_selector=cfg.date_selector,
+                        date_format=cfg.date_format,
+                        article_body_selector=cfg.article_body_selector,
+                        link_base_url=cfg.link_base_url,
+                    )
+                    stats = await ingest_ir_press(
+                        session=session,
+                        http_client=http_client,
+                        extractor=extractor,
+                        config=ir_config,
+                        since=since,
+                    )
+                _print_stats(f"IR/{cfg.entity_canonical_name}", stats)
+                total += stats
+            _print_stats("IR/total", total)
     finally:
         await engine.dispose()
 

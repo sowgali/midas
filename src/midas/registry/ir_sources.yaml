@@ -1,0 +1,63 @@
+# V1.7 IR (Investor Relations) sources.
+#
+# Per-entity declarative configuration for non-SEC sources: company
+# news / blog feeds. These complement SEC filings — same dedup pipeline
+# absorbs overlap when the same deal appears in both.
+#
+# Two source types are supported:
+#   - rss:        feed URL only (cheap to add; RssFeed adapter parses)
+#   - ir_press:   per-site CSS-selector scraper (when no feed exists)
+#
+# All URLs were probed live before commit; mark TODO when no public
+# feed exists rather than guessing selectors that will quietly break.
+
+sources:
+  # ---------- Hyperscalers ----------
+  - entity_canonical_name: "Microsoft Corporation"
+    type: rss
+    feed_url: "https://blogs.microsoft.com/ai/feed/"
+    publisher: "Microsoft AI Blog"
+    source_type: blog
+
+  - entity_canonical_name: "Alphabet Inc."
+    type: rss
+    feed_url: "https://blog.google/rss/"
+    publisher: "Google Blog"
+    source_type: blog
+
+  - entity_canonical_name: "Amazon.com, Inc."
+    type: rss
+    feed_url: "https://www.aboutamazon.com/news/rss"
+    publisher: "About Amazon"
+    source_type: news
+
+  - entity_canonical_name: "Meta Platforms, Inc."
+    type: rss
+    feed_url: "https://about.fb.com/news/feed/"
+    publisher: "Meta Newsroom"
+    source_type: news
+
+  # ---------- Private AI labs (no SEC; this is the only path) ----------
+  - entity_canonical_name: "OpenAI"
+    type: rss
+    # Canonical URL per their atom:link self-reference.
+    feed_url: "https://openai.com/news/rss"
+    publisher: "OpenAI"
+    source_type: blog
+
+  # TODO Anthropic: no public RSS feed; news page is JS-rendered.
+  # Needs a Playwright-based scraper (V1.8) — defer.
+
+  # ---------- Chips / hardware ----------
+  - entity_canonical_name: "NVIDIA Corporation"
+    type: rss
+    feed_url: "https://blogs.nvidia.com/feed/"
+    publisher: "NVIDIA Blog"
+    source_type: blog
+
+  # ---------- Tooling / infra ----------
+  - entity_canonical_name: "Hugging Face"
+    type: rss
+    feed_url: "https://huggingface.co/blog/feed.xml"
+    publisher: "Hugging Face Blog"
+    source_type: blog
