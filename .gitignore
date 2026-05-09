@@ -220,3 +220,8 @@ __marimo__/
 # midas
 data/*
 !data/.gitkeep
+# Claude Code per-user state (settings, tasks, transcripts)
+.claude/
+# Rendered graph output — regenerated via `midas graph render`
+graph.html
+*.graph.html
