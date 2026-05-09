@@ -15,9 +15,11 @@ sources:
   # ---------- Hyperscalers ----------
   - entity_canonical_name: "Microsoft Corporation"
     type: rss
-    feed_url: "https://blogs.microsoft.com/ai/feed/"
-    publisher: "Microsoft AI Blog"
-    source_type: blog
+    # blogs.microsoft.com/ai/ has been stale since 2022; news.microsoft.com/source
+    # is Microsoft's current corporate news feed.
+    feed_url: "https://news.microsoft.com/source/feed/"
+    publisher: "Microsoft Source"
+    source_type: news
 
   - entity_canonical_name: "Alphabet Inc."
     type: rss
@@ -38,15 +40,12 @@ sources:
     source_type: news
 
   # ---------- Private AI labs (no SEC; this is the only path) ----------
-  - entity_canonical_name: "OpenAI"
-    type: rss
-    # Canonical URL per their atom:link self-reference.
-    feed_url: "https://openai.com/news/rss"
-    publisher: "OpenAI"
-    source_type: blog
-
+  # TODO OpenAI: RSS exists at https://openai.com/news/rss but Cloudflare
+  # blocks GET requests with HTTP-client fingerprints (browser-like UAs
+  # also rejected — JA3/TLS fingerprinting). Needs Playwright (V1.8).
+  #
   # TODO Anthropic: no public RSS feed; news page is JS-rendered.
-  # Needs a Playwright-based scraper (V1.8) — defer.
+  # Same Playwright fix would unlock both.
 
   # ---------- Chips / hardware ----------
   - entity_canonical_name: "NVIDIA Corporation"

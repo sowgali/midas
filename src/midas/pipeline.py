@@ -322,9 +322,26 @@ async def ingest_ir_press(
     config: IrPressConfig,
     since: date | None = None,
 ) -> IngestStats:
-    """Fetch + ingest one company's IR press feed."""
+    """Fetch + ingest one company's IR press feed.
+
+    Resilient at the index level: a 403 / 5xx / parse-error on the
+    index page returns an :class:`IngestStats` with one error entry
+    rather than raising — keeps a multi-source run going past one
+    bad site.
+    """
     press = IrPress(config, http_client=http_client)
-    items = await press.list_items(since=since)
+    try:
+        items = await press.list_items(since=since)
+    except Exception as exc:
+        log.warning(
+            "pipeline.ir_press.list_items_failed",
+            index_url=config.index_url,
+            error=str(exc),
+        )
+        return IngestStats(
+            errors=[f"{config.publisher}/{config.index_url}: list_items failed: {exc}"],
+        )
+
     resolver = await EntityResolver.from_session(session)
 
     total = IngestStats()
@@ -360,6 +377,11 @@ async def ingest_rss_feed(
     extraction is the generic "drop-script-find-article" fallback
     inside :class:`RssFeed`; configurable per-site selectors live on
     the IR-press path.
+
+    Resilient at the feed-index level: a 403 / 5xx / parse-error on
+    the feed itself returns an :class:`IngestStats` with one error
+    entry rather than raising — keeps a multi-feed run going past
+    one bad feed.
     """
     feed = RssFeed(
         entity_id=entity_id,
@@ -368,7 +390,12 @@ async def ingest_rss_feed(
         source_type=source_type,
         http_client=http_client,
     )
-    items = await feed.list_items(since=since)
+    try:
+        items = await feed.list_items(since=since)
+    except Exception as exc:
+        log.warning("pipeline.rss.list_items_failed", feed_url=feed_url, error=str(exc))
+        return IngestStats(errors=[f"{publisher}/{feed_url}: list_items failed: {exc}"])
+
     resolver = await EntityResolver.from_session(session)
 
     total = IngestStats()
