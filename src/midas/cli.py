@@ -103,6 +103,27 @@ def version() -> None:
 
 
 @app.command()
+def serve(
+    host: Annotated[
+        str,
+        typer.Option(help="Bind host for the HTTP server."),
+    ] = "127.0.0.1",
+    port: Annotated[
+        int,
+        typer.Option(help="Bind port for the HTTP server."),
+    ] = 8000,
+    reload: Annotated[
+        bool,
+        typer.Option("--reload", help="Restart the server on source changes (dev only)."),
+    ] = False,
+) -> None:
+    """Run the FastAPI server (point a frontend at http://localhost:8000)."""
+    import uvicorn
+
+    uvicorn.run("midas.api.app:app", host=host, port=port, reload=reload)
+
+
+@app.command()
 def init(
     seed_only: Annotated[
         bool,
