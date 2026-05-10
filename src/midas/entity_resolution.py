@@ -159,6 +159,14 @@ _AGGREGATE_SUFFIX_TOKENS: frozenset[str] = frozenset(
         "attendee",
         "sponsors",
         "sponsor",
+        # V1.9.3 frontier-run additions: LLM frequently emits these
+        # as a stand-in for "a bunch of people on a project / contest".
+        "team",
+        "teams",
+        "suppliers",
+        "supplier",
+        "consortium",
+        "syndicate",
     },
 )
 
@@ -213,6 +221,16 @@ _GENERIC_NON_ENTITIES: frozenset[str] = frozenset(
         "stockholders",
         "creditors",
         "lenders",
+        # V1.9.3 — frontier-run additions. The LLM frequently emits
+        # these as a stand-in for "a list of named investors" that we
+        # don't want to materialise as a single graph node.
+        "investor group",
+        "investor consortium",
+        "investment group",
+        "investment consortium",
+        "investor syndicate",
+        "buyer group",
+        "founding investors",
         # Litigation generics
         "claimants",
         "plaintiffs",
@@ -242,6 +260,13 @@ _GENERIC_NON_ENTITIES: frozenset[str] = frozenset(
 )
 
 
+# Parenthetical descriptors the LLM appends to vague counterparties.
+# "Investors (unspecified)" / "first-place team (unspecified)" /
+# "Investor group (Google, Amazon, ...)" — strip the parenthetical so
+# the suffix check sees the real category word.
+_PARENTHETICAL_RE = re.compile(r"\s*\([^)]*\)\s*")
+
+
 def is_extractable_entity_name(name: str) -> bool:
     """Heuristic: should this string auto-create a discovered entity?
 
@@ -249,6 +274,10 @@ def is_extractable_entity_name(name: str) -> bool:
     non-entity strings. Liberal: anything plausibly a real org passes.
     Borderline cases (executives' personal names, regulatory bodies) are
     deliberately allowed through and triaged at the human-review step.
+
+    Strips parentheticals before applying the aggregate-suffix check so
+    LLM-emitted stand-ins like "Investors (unspecified)" or "Investor
+    group (Google, Amazon, ...)" hit the right token.
     """
     s = name.strip()
     if len(s) < 3:
@@ -259,12 +288,22 @@ def is_extractable_entity_name(name: str) -> bool:
     if not any(c.isalpha() for c in s):
         return False
 
-    tokens = s.split()
-    # Reject "Undisclosed *", "Unspecified *", "Various *".
-    if tokens and tokens[0].lower() in _PLACEHOLDER_PREFIX_TOKENS:
+    # Strip "(unspecified)" / "(Google, Amazon, ...)" before tokenizing
+    # so the prefix / suffix checks see the real noun. The original
+    # string is still consulted for length and case-sensitive checks
+    # above so we don't accidentally allow "(())" through.
+    stripped = _PARENTHETICAL_RE.sub(" ", s).strip()
+    if stripped.lower() in _GENERIC_NON_ENTITIES:
         return False
-    # Reject "* Winner(s)", "* Participants", "* Authors", "* Region".
-    if tokens and tokens[-1].lower().rstrip(",.") in _AGGREGATE_SUFFIX_TOKENS:
+
+    tokens = stripped.split()
+    if not tokens:
+        return False
+    # Reject "Undisclosed *", "Unspecified *", "Various *".
+    if tokens[0].lower() in _PLACEHOLDER_PREFIX_TOKENS:
+        return False
+    # Reject "* Winner(s)", "* Participants", "* Team", "* Suppliers", etc.
+    if tokens[-1].lower().rstrip(",.") in _AGGREGATE_SUFFIX_TOKENS:
         return False
 
     # All-lowercase single words are usually generic ("vendors",

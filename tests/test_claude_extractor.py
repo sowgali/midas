@@ -276,3 +276,67 @@ async def test_unrecognized_tool_name_is_ignored() -> None:
     deals = await extractor.extract(_ctx())
 
     assert deals == []
+
+
+# ---------- Oversize doc + bad-request handling (V1.9.3 fixes) ----------
+
+
+@pytest.mark.asyncio
+async def test_oversize_document_is_truncated_before_send() -> None:
+    """Documents past ~1.8M chars should be truncated before reaching the
+    API so a single huge HTML payload can't blow past the 1M-token cap.
+    """
+    captured: dict[str, object] = {}
+    client = AsyncMock()
+
+    async def fake_create(**kwargs: object) -> SimpleNamespace:
+        captured.update(kwargs)
+        return SimpleNamespace(content=[])
+
+    client.messages.create = fake_create
+    extractor = ClaudeExtractor(client=client)
+
+    # 3MB doc — comfortably past the 1.8MB budget.
+    huge_text = "Microsoft will invest $10 billion in OpenAI. " * 70_000
+    assert len(huge_text) > 2_000_000
+
+    await extractor.extract(_ctx(text=huge_text))
+
+    user_msg = captured["messages"][0]["content"]  # type: ignore[index]
+    assert isinstance(user_msg, str)
+    # The truncation marker is appended; total bytes well under the budget.
+    assert "[... document truncated to fit context window ...]" in user_msg
+    # Body content under the budget cap (chars, with overhead for the
+    # known-parties block + scaffolding ~few hundred bytes).
+    doc_section = user_msg.split("Document text:\n---\n", 1)[1].split("---\n\n", 1)[0]
+    assert len(doc_section) < 1_900_000  # the cap + marker only
+
+
+@pytest.mark.asyncio
+async def test_bad_request_error_returns_empty_instead_of_crashing() -> None:
+    """If the API rejects the prompt (token cap, schema drift, etc.),
+    the extractor logs and returns []; the surrounding pipeline keeps
+    processing other documents.
+    """
+    import anthropic
+
+    client = AsyncMock()
+    # Build a plausible BadRequestError. The SDK's constructor wants a
+    # message + a response + a body; SimpleNamespace stand-ins are fine
+    # because the extractor only str()s the exception.
+    fake_response = SimpleNamespace(
+        status_code=400,
+        headers={},
+        request=SimpleNamespace(),
+    )
+    err = anthropic.BadRequestError(
+        "prompt is too long: 3043747 tokens > 1000000 maximum",
+        response=fake_response,  # type: ignore[arg-type]
+        body=None,
+    )
+    client.messages.create = AsyncMock(side_effect=err)
+    extractor = ClaudeExtractor(client=client)
+
+    # Doesn't raise — returns no deals so the pipeline moves on.
+    deals = await extractor.extract(_ctx(text="anything"))
+    assert deals == []

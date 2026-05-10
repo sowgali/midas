@@ -41,6 +41,20 @@ if TYPE_CHECKING:
 
 _MODEL_ID = "claude-opus-4-7"
 
+# Document-text budget. Opus 4.7 caps at 1M input tokens; we leave
+# ~400K headroom for system prompt + tool definition + known-parties +
+# Claude's response. ~3 chars/token is the conservative ratio for
+# English prose, so 1.8M chars = ~600K tokens of doc text. Press
+# releases and earnings extracts that exceed this are typically one of:
+# (a) a PDF rendered to enormous HTML with redundant whitespace, or
+# (b) a multi-article concatenation that should have been split feed-side.
+# Either way we truncate from the END — money-flow claims are
+# overwhelmingly front-loaded in press releases (lede + first
+# paragraphs); the tail is usually boilerplate / forward-looking-
+# statement legalese / unrelated content.
+_MAX_DOCUMENT_CHARS = 1_800_000
+_TRUNCATION_MARKER = "\n\n[... document truncated to fit context window ...]"
+
 _SYSTEM_PROMPT = """\
 You extract directional money-flow claims from press releases, filings, \
 and news text. For every distinct claim about money moving from one \
@@ -198,6 +212,18 @@ class ClaudeExtractor:
     async def extract(self, context: ExtractionContext) -> list[ExtractedDeal]:
         client = self._get_client()
 
+        # Guard against documents that would blow past the 1M-token cap.
+        # One outsized doc shouldn't tank a whole ingest run.
+        document_text = context.document_text
+        if len(document_text) > _MAX_DOCUMENT_CHARS:
+            log.warning(
+                "claude.document_truncated",
+                source_url=context.source_url,
+                original_chars=len(document_text),
+                kept_chars=_MAX_DOCUMENT_CHARS,
+            )
+            document_text = document_text[:_MAX_DOCUMENT_CHARS] + _TRUNCATION_MARKER
+
         user_message = (
             f"Source URL: {context.source_url}\n"
             f"Source type: {context.source_type.value}\n\n"
@@ -206,7 +232,7 @@ class ClaudeExtractor:
             f"{_format_known_parties(context.known_parties)}\n\n"
             f"Document text:\n"
             f"---\n"
-            f"{context.document_text}\n"
+            f"{document_text}\n"
             f"---\n\n"
             f"Emit one `record_deal` tool call per distinct money-flow "
             f"claim. If the document has no such claims, emit no tool calls."
@@ -219,29 +245,42 @@ class ClaudeExtractor:
         # both ranges land before the per-document user message and
         # cache cleanly. Per the prompt-caching guidance: stable bytes
         # first, volatile bytes after.
-        response = await client.messages.create(
-            model=self._model,
-            max_tokens=4096,
-            system=[
-                {
-                    "type": "text",
-                    "text": _SYSTEM_PROMPT,
-                    "cache_control": {"type": "ephemeral"},
-                }
-            ],
-            tools=[
-                {
-                    "name": "record_deal",
-                    "description": (
-                        "Record a single directional money-flow claim "
-                        "from the document. Call once per distinct deal."
-                    ),
-                    "input_schema": _RECORD_DEAL_SCHEMA,
-                    "cache_control": {"type": "ephemeral"},
-                }
-            ],
-            messages=[{"role": "user", "content": user_message}],
-        )
+        try:
+            response = await client.messages.create(
+                model=self._model,
+                max_tokens=4096,
+                system=[
+                    {
+                        "type": "text",
+                        "text": _SYSTEM_PROMPT,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+                tools=[
+                    {
+                        "name": "record_deal",
+                        "description": (
+                            "Record a single directional money-flow claim "
+                            "from the document. Call once per distinct deal."
+                        ),
+                        "input_schema": _RECORD_DEAL_SCHEMA,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+                messages=[{"role": "user", "content": user_message}],
+            )
+        except anthropic.BadRequestError as exc:
+            # Fail-soft: a single document hitting the API's input limit
+            # (or any other 400) should NOT kill an entire frontier run.
+            # Log enough to debug + return zero deals so the pipeline
+            # marks the document as "seen, nothing extracted" and moves on.
+            log.warning(
+                "claude.bad_request",
+                source_url=context.source_url,
+                document_chars=len(document_text),
+                error=str(exc),
+            )
+            return []
 
         deals: list[ExtractedDeal] = []
         for block in response.content:

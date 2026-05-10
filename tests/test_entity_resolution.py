@@ -167,10 +167,34 @@ def test_filter_rejects_placeholder_prefix(name: str) -> None:
         "2025 Anthropic Fellows awardees",
         "Grant recipients",
         "Award nominees",
+        # V1.9.3 — learned from auto-frontier crash debug:
+        # "(unspecified)" suffix and parenthetical investor lists.
+        "Investors (unspecified)",
+        "customers (unspecified)",
+        "First-place hackathon team (unspecified)",
+        "Second-place team (unspecified)",
+        "Third-place team (unspecified)",
+        "Top student participants (unspecified)",
+        "Investor group (Google, Amazon, Nvidia, Salesforce, Sequoia)",
+        "investment consortium",
+        "clean and renewable energy suppliers (unspecified)",
+        "Funding syndicate",
     ],
 )
 def test_filter_rejects_aggregate_suffix(name: str) -> None:
     assert not is_extractable_entity_name(name), f"should reject: {name!r}"
+
+
+def test_filter_keeps_real_names_with_parentheticals() -> None:
+    """Parenthetical stripping shouldn't reject real names that *happen* to
+    have a parenthetical clarifier (rare in corp names, common in
+    geo / regulatory ones).
+    """
+    # "European Commission (EC)" is the EC; after stripping, "European
+    # Commission" remains and that's clearly a real entity.
+    assert is_extractable_entity_name("European Commission (EC)")
+    # "Three Mile Island (TMI)" — the plant, not an aggregate.
+    assert is_extractable_entity_name("Three Mile Island (TMI)")
 
 
 def test_filter_still_passes_borderline_real_entities() -> None:
