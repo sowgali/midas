@@ -23,6 +23,7 @@ from midas.discovery.sources import (
     derive_domain_candidates,
     discover_for_entity,
     feed_url_candidates,
+    is_discoverable_entity_name,
     is_feed_response,
     probe_feed,
 )
@@ -193,7 +194,13 @@ def _entity(name: str) -> Entity:
 
 @pytest.mark.asyncio
 async def test_discover_returns_first_hit_when_max_results_is_one() -> None:
-    """First feed-shaped response wins; later candidates aren't probed."""
+    """First domain that yields a hit wins; later domains aren't tried.
+
+    Note: candidate URLs *within* a domain are probed concurrently for
+    speed, so a single domain produces ~36 in-flight requests before
+    one of them returns a hit. The contract this test pins is *no
+    requests to the second domain* once the first domain hits.
+    """
     calls: list[str] = []
 
     def handler(req: httpx.Request) -> httpx.Response:
@@ -216,8 +223,10 @@ async def test_discover_returns_first_hit_when_max_results_is_one() -> None:
     assert len(found) == 1
     assert isinstance(found[0], SourceCandidate)
     assert found[0].feed_url == "https://vertiv.com/feed"
-    # First candidate domain (vertiv.com), first feed pattern (/feed) — one call.
-    assert calls == ["https://vertiv.com/feed"]
+    # All probes confined to the first parent domain (vertiv.com + its
+    # blog./news./etc subdomains) — no spillover to fallback parent domains.
+    domains_called = {httpx.URL(u).host for u in calls}
+    assert all(h == "vertiv.com" or h.endswith(".vertiv.com") for h in domains_called)
 
 
 @pytest.mark.asyncio
@@ -272,6 +281,62 @@ async def test_discover_max_results_truncates() -> None:
     assert len(found) == 2
     # Two distinct domains since we break out after the first per-domain hit.
     assert found[0].feed_url != found[1].feed_url
+
+
+# ---------- is_discoverable_entity_name ----------
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "Vertiv Holdings Co",
+        "Constellation Energy",
+        "ASML",
+        "Hewlett Packard Enterprise Company",
+        "Crusoe Energy Systems",
+    ],
+)
+def test_discoverable_passes_real_companies(name: str) -> None:
+    assert is_discoverable_entity_name(name)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "Prof. Iryna Gurevych (UKP Lab, TU Darmstadt)",
+        "Dr. John Smith",
+        "HELMET (Princeton Language and Intelligence)",
+        "EduRénov program (public school renovation projects)",
+        "ChatGPT Futures Class of 2026 honorees",
+        "FilBench authors",
+        "Survey respondents",
+        "AIMO Prize",
+        # Pathologically long (>60).
+        "X" * 80,
+        "",  # empty
+    ],
+)
+def test_discoverable_rejects_unfriendly_names(name: str) -> None:
+    assert not is_discoverable_entity_name(name)
+
+
+@pytest.mark.asyncio
+async def test_discover_skips_unfriendly_names_without_probing() -> None:
+    """If the name fails the pre-filter, no HTTP at all."""
+    calls: list[str] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        calls.append(str(req.url))
+        return httpx.Response(200, content=b"<?xml?><rss/>")
+
+    async with httpx.AsyncClient(transport=_mock_transport(handler)) as client:
+        found = await discover_for_entity(
+            client,
+            _entity("Prof. Some Researcher (Some Lab, Some University)"),
+        )
+
+    assert found == []
+    assert calls == []
 
 
 @pytest.mark.asyncio

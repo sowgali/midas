@@ -30,6 +30,7 @@ from .sources import (
     derive_domain_candidates,
     discover_for_entity,
     feed_url_candidates,
+    is_discoverable_entity_name,
     is_feed_response,
     probe_feed,
 )
@@ -39,6 +40,7 @@ __all__ = [
     "derive_domain_candidates",
     "discover_for_entity",
     "feed_url_candidates",
+    "is_discoverable_entity_name",
     "is_feed_response",
     "probe_feed",
 ]

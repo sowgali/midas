@@ -638,11 +638,14 @@ async def _discover_frontier(
                     ),
                 )
 
-            # Phase 1 — discover sources for discovered entities.
-            typer.echo("  [phase 1] discover sources for discovered entities...")
+            # Phase 1 — discover sources for any entity that doesn't yet
+            # have a validated feed. First round picks up curated tier-2
+            # rows (Vertiv, Constellation, etc.); later rounds pick up
+            # entities surfaced by the previous round's ingest.
+            typer.echo("  [phase 1] discover sources for entities lacking a feed...")
             await _discover_sources(
                 limit=per_round_limit,
-                discovered_only=True,
+                discovered_only=False,
                 entity_filter=None,
                 dry_run=False,
             )

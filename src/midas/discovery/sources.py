@@ -17,10 +17,16 @@ Three pure-ish primitives compose into :func:`discover_for_entity`:
 Designed for testability: every external call is async + mockable, and
 the URL-generation steps are pure functions so they can be tested
 without any HTTP at all.
+
+Per-entity probes run concurrently within a domain (asyncio.gather),
+so a domain that hosts a feed at ``/feed`` and 35 dead URLs takes ~one
+HTTP timeout instead of ~36. The first hit on a domain wins; later
+domains aren't tried unless the first comes up empty.
 """
 
 from __future__ import annotations
 
+import asyncio
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -32,6 +38,50 @@ from midas.models import Entity
 from midas.models.types import SourceType
 
 log = structlog.get_logger(__name__)
+
+# Per-probe HTTP timeout. 2.5s is short enough that a dead domain costs
+# under 3s total (with concurrent probing) and long enough that a real
+# slow CDN still answers.
+_PROBE_TIMEOUT_S = 2.5
+
+# Per-entity total wall-clock cap. A degenerate name that generates many
+# domains shouldn't be allowed to monopolise the discovery phase.
+_PER_ENTITY_TIMEOUT_S = 12.0
+
+
+# Names that won't yield a useful corporate domain. We skip discovery
+# for these instead of burning probe time on garbage. Most common
+# pattern: extracted-prose names that are people, programs, or
+# parenthetical phrases — nothing the open-world resolver can validate
+# until human review reclassifies them.
+_DOMAIN_BLOCKLIST_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^\s*(prof|dr|mr|mrs|ms|sir)\.?\s", re.IGNORECASE),  # personal titles
+    re.compile(r"\(.*?\)"),  # parentheticals — long taxonomic names
+    re.compile(r"\b(authors|respondents|attendees|sponsors|recipients)\s*$", re.IGNORECASE),
+    re.compile(r"\b(program|programme|initiative|fellowship|prize|class|cohort)\b", re.IGNORECASE),
+    re.compile(r"\b(gold medal|first place|second place|honoree|honoree)\b", re.IGNORECASE),
+)
+
+
+def is_discoverable_entity_name(canonical_name: str) -> bool:
+    """Cheap pre-filter: does this name look like it could resolve to a domain?
+
+    Conservative — we'd rather skip a real but unusual name than burn
+    seconds on a junk one. The :func:`is_extractable_entity_name`
+    filter is the *first* line of defense (we already pruned the
+    obvious garbage); this is a *second* line that catches
+    domain-unfriendly shapes specifically.
+
+    Reject criteria:
+
+    - Personal titles ("Prof.", "Dr.")
+    - Parentheticals (taxonomic descriptors, lab affiliations)
+    - Tail words signalling an aggregate / programme rather than a co
+    - Pathologically long (>60 chars; real corporate names rarely are)
+    """
+    if not canonical_name or len(canonical_name) > 60:
+        return False
+    return all(not pat.search(canonical_name) for pat in _DOMAIN_BLOCKLIST_PATTERNS)
 
 
 # ---------- pure URL generation ----------
@@ -218,11 +268,10 @@ async def probe_feed(client: httpx.AsyncClient, url: str) -> httpx.Response | No
     """Fetch ``url`` and return the response iff it parses as a feed.
 
     On HTTP error, non-feed body, or network failure: returns ``None``
-    (caller treats as "not a feed here, try next"). 5s timeout per
-    candidate — discovery should never block ingest noticeably.
+    (caller treats as "not a feed here, try next").
     """
     try:
-        resp = await client.get(url, timeout=httpx.Timeout(5.0))
+        resp = await client.get(url, timeout=httpx.Timeout(_PROBE_TIMEOUT_S))
     except (httpx.HTTPError, httpx.InvalidURL) as exc:
         log.debug("discover.probe.network_error", url=url, err=str(exc))
         return None
@@ -256,6 +305,42 @@ class SourceCandidate:
     source_type: SourceType
 
 
+async def _probe_domain_concurrently(
+    client: httpx.AsyncClient,
+    urls: list[str],
+) -> str | None:
+    """Probe every URL for one domain concurrently; return the first hit.
+
+    Concurrency makes a *huge* difference on dead domains: instead of
+    paying timeout-seconds times 36 candidates serially, one timeout
+    window covers all probes in parallel. Real domains still return
+    their first hit fast (~100-300 ms).
+    """
+    import contextlib
+
+    tasks = [asyncio.create_task(probe_feed(client, url)) for url in urls]
+    try:
+        for finished in asyncio.as_completed(tasks):
+            resp = await finished
+            if resp is None:
+                continue
+            # We have a hit — cancel pending probes and return its URL.
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            return str(resp.request.url)
+        return None
+    finally:
+        # Belt-and-suspenders: ensure no orphan tasks survive the function.
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        # Drain so cancellations propagate cleanly.
+        for t in tasks:
+            with contextlib.suppress(asyncio.CancelledError, httpx.HTTPError, httpx.InvalidURL):
+                await t
+
+
 async def discover_for_entity(
     client: httpx.AsyncClient,
     entity: Entity,
@@ -265,27 +350,32 @@ async def discover_for_entity(
 ) -> list[SourceCandidate]:
     """Probe candidate feed URLs for ``entity``; return validated ones.
 
-    Walks ``derive_domain_candidates(entity.canonical_name)`` (or the
-    explicit ``domain_overrides`` if provided), tries each candidate
-    URL in order, and stops at ``max_results`` hits. One hit per
-    entity is usually sufficient — multiple feeds for the same org
-    tend to overlap heavily, costing extraction tokens without adding
-    coverage.
+    Per-domain probes run concurrently (one HTTP timeout window covers
+    all 36 candidate URLs). Domains are tried in order; the first
+    domain that yields a hit is enough for ``max_results=1``. The whole
+    call is wrapped in a wall-clock timeout so a degenerate name can't
+    monopolise the discovery phase.
     """
     found: list[SourceCandidate] = []
-    domains = list(domain_overrides) if domain_overrides is not None else derive_domain_candidates(
-        entity.canonical_name,
-    )
-    for domain in domains:
-        for url in feed_url_candidates(domain):
-            resp = await probe_feed(client, url)
-            if resp is None:
+    if domain_overrides is not None:
+        domains = list(domain_overrides)
+    elif not is_discoverable_entity_name(entity.canonical_name):
+        log.debug("discover.entity.skipped_unfriendly_name", entity=entity.canonical_name)
+        return found
+    else:
+        domains = derive_domain_candidates(entity.canonical_name)
+
+    async def _walk() -> None:
+        for domain in domains:
+            urls = feed_url_candidates(domain)
+            hit = await _probe_domain_concurrently(client, urls)
+            if hit is None:
                 continue
             found.append(
                 SourceCandidate(
                     entity_id=entity.id,
                     canonical_name=entity.canonical_name,
-                    feed_url=url,
+                    feed_url=hit,
                     publisher=f"{entity.canonical_name} (auto-discovered)",
                     source_type=SourceType.BLOG,
                 ),
@@ -293,9 +383,17 @@ async def discover_for_entity(
             log.info(
                 "discover.feed.hit",
                 entity=entity.canonical_name,
-                url=url,
+                url=hit,
             )
             if len(found) >= max_results:
-                return found
-            break  # don't try more paths on this domain once we have a hit
+                return
+
+    try:
+        await asyncio.wait_for(_walk(), timeout=_PER_ENTITY_TIMEOUT_S)
+    except TimeoutError:
+        log.warning(
+            "discover.entity.timeout",
+            entity=entity.canonical_name,
+            partial_hits=len(found),
+        )
     return found
