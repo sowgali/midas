@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from datetime import date
+from decimal import Decimal
 from pathlib import Path
 from typing import Annotated
 
@@ -37,12 +38,13 @@ from midas.pipeline import (
     ingest_sec_filings_for_ticker,
 )
 from midas.registry import (
-    PlaywrightSourceConfig as YamlPlaywrightSourceConfig,
-)
-from midas.registry import (
+    IrPressSourceConfig,
     RssSourceConfig,
     load_seed_registry,
     parse_ir_sources,
+)
+from midas.registry import (
+    PlaywrightSourceConfig as YamlPlaywrightSourceConfig,
 )
 from midas.sources.http_client import HttpClient
 from midas.sources.ir_press import IrPressConfig
@@ -250,10 +252,46 @@ async def _ingest_ir(
     since: date | None,
     extractor: Extractor,
 ) -> None:
+    from sqlmodel import select
+
+    from midas.models import DiscoveredSource, Entity
     from midas.pipeline import ingest_ir_press
     from midas.storage.repository import EntityRepository
 
-    configs = parse_ir_sources()
+    configs: list[
+        RssSourceConfig | IrPressSourceConfig | YamlPlaywrightSourceConfig
+    ] = list(parse_ir_sources())
+
+    # V1.9.2: also pick up auto-discovered feeds from the DB. Each
+    # DiscoveredSource row contributes an in-memory RssSourceConfig
+    # alongside the YAML bootstrap. ``parse_ir_sources`` stays pure
+    # (still tested against the YAML); the union happens here.
+    engine_for_disc = make_engine()
+    try:
+        async with AsyncSession(engine_for_disc, expire_on_commit=False) as disc_session:
+            rows = list(
+                (
+                    await disc_session.execute(
+                        select(DiscoveredSource, Entity)
+                        .join(Entity, DiscoveredSource.entity_id == Entity.id)  # type: ignore[arg-type]
+                        .where(DiscoveredSource.status == "valid"),
+                    )
+                )
+                .all(),
+            )
+        for row, ent in rows:
+            configs.append(
+                RssSourceConfig(
+                    entity_canonical_name=ent.canonical_name,
+                    type="rss",
+                    feed_url=row.feed_url,
+                    publisher=row.publisher,
+                    source_type=row.source_type,
+                ),
+            )
+    finally:
+        await engine_for_disc.dispose()
+
     if entity_filter is not None:
         configs = [c for c in configs if c.entity_canonical_name.lower() == entity_filter.lower()]
         if not configs:
@@ -497,6 +535,585 @@ async def _review_promote(
                 f"Promoted: {ent.canonical_name} "
                 f"(ticker={ent.ticker} cik={ent.cik} sectors={ent.sector_tags})",
             )
+    finally:
+        await engine.dispose()
+
+
+# ---------- discover ----------
+
+
+discover_app = typer.Typer(
+    help="Auto-discover feed URLs for entities lacking a curated source.",
+    no_args_is_help=True,
+)
+app.add_typer(discover_app, name="discover")
+
+
+@discover_app.command("frontier")
+def discover_frontier(
+    max_rounds: Annotated[
+        int,
+        typer.Option(help="Cap on BFS rounds (safety bound; loop also stops on convergence)."),
+    ] = 3,
+    per_round_limit: Annotated[
+        int,
+        typer.Option(help="Max entities probed per round."),
+    ] = 30,
+    extractor_name: Annotated[
+        str,
+        typer.Option("--extractor", help="Extractor to use for downstream ingest."),
+    ] = "regex",
+    since: Annotated[
+        str | None,
+        typer.Option(help="ISO date — only ingest items on/after this."),
+    ] = None,
+) -> None:
+    """Run the V1.9.2 BFS frontier loop until convergence.
+
+    Each round:
+
+    1. Probe heuristic feed URLs for every discovered entity that
+       doesn't yet have a validated source.
+    2. Ingest from the just-validated feeds (and any prior DB-discovered
+       feeds that haven't been polled).
+    3. New entities surface via the open-world resolver. Goto 1.
+
+    Stops on the first round where no new sources land OR no new
+    entities are discovered, or at ``--max-rounds``. Use ``--extractor
+    regex`` (default, free) for cheap dry-runs; switch to ``claude`` to
+    actually extract deals.
+    """
+    since_date = date.fromisoformat(since) if since else None
+    extractor = _build_extractor(extractor_name)
+    asyncio.run(
+        _discover_frontier(
+            max_rounds=max_rounds,
+            per_round_limit=per_round_limit,
+            extractor=extractor,
+            since=since_date,
+        ),
+    )
+
+
+async def _discover_frontier(
+    *,
+    max_rounds: int,
+    per_round_limit: int,
+    extractor: Extractor,
+    since: date | None,
+) -> None:
+    from sqlmodel import col, select
+
+    from midas.models import DiscoveredSource, Entity
+
+    engine = make_engine()
+    try:
+        for round_n in range(1, max_rounds + 1):
+            typer.echo(f"\n=========  Round {round_n} / {max_rounds}  =========")
+
+            # Snapshot pre-state to detect convergence later.
+            async with AsyncSession(engine, expire_on_commit=False) as snap_session:
+                pre_entity_count = len(
+                    list(
+                        (
+                            await snap_session.execute(
+                                select(Entity).where(col(Entity.discovered).is_(True)),
+                            )
+                        )
+                        .scalars()
+                        .all(),
+                    ),
+                )
+                pre_source_count = len(
+                    list(
+                        (
+                            await snap_session.execute(
+                                select(DiscoveredSource).where(
+                                    DiscoveredSource.status == "valid",
+                                ),
+                            )
+                        )
+                        .scalars()
+                        .all(),
+                    ),
+                )
+
+            # Phase 1 — discover sources for discovered entities.
+            typer.echo("  [phase 1] discover sources for discovered entities...")
+            await _discover_sources(
+                limit=per_round_limit,
+                discovered_only=True,
+                entity_filter=None,
+                dry_run=False,
+            )
+
+            # Phase 2 — ingest only the just-added sources (cheap proxy:
+            # re-run full IR ingest; the dedup layer skips already-seen
+            # documents by content_sha256, so re-runs are no-ops on the
+            # unchanged feeds).
+            typer.echo("  [phase 2] ingest the validated feeds...")
+            await _ingest_ir(None, since, extractor)
+
+            # Convergence check.
+            async with AsyncSession(engine, expire_on_commit=False) as snap_session:
+                post_entity_count = len(
+                    list(
+                        (
+                            await snap_session.execute(
+                                select(Entity).where(col(Entity.discovered).is_(True)),
+                            )
+                        )
+                        .scalars()
+                        .all(),
+                    ),
+                )
+                post_source_count = len(
+                    list(
+                        (
+                            await snap_session.execute(
+                                select(DiscoveredSource).where(
+                                    DiscoveredSource.status == "valid",
+                                ),
+                            )
+                        )
+                        .scalars()
+                        .all(),
+                    ),
+                )
+            new_entities = post_entity_count - pre_entity_count
+            new_sources = post_source_count - pre_source_count
+            typer.echo(
+                f"  round summary: +{new_sources} sources, +{new_entities} discovered entities",
+            )
+            if new_sources == 0 and new_entities == 0:
+                typer.echo("Converged — no new sources or entities. Stopping.")
+                break
+        else:
+            typer.echo("\nReached max-rounds cap; the frontier may still have work to do.")
+    finally:
+        await engine.dispose()
+
+
+@discover_app.command("sources")
+def discover_sources(
+    limit: Annotated[
+        int,
+        typer.Option(help="Max entities to probe."),
+    ] = 25,
+    discovered_only: Annotated[
+        bool,
+        typer.Option(
+            "--discovered-only/--all",
+            help="Only probe entities with discovered=true (the BFS frontier). "
+            "Pass --all to also probe curated entities (e.g. backfilling Vertiv).",
+        ),
+    ] = True,
+    entity: Annotated[
+        str | None,
+        typer.Option(help="Only probe this canonical name (substring match)."),
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Print hits but don't persist."),
+    ] = False,
+) -> None:
+    """Probe heuristic feed URLs for entities lacking a curated source.
+
+    Runs the V1.9.2 BFS source-discovery loop: for each candidate
+    entity, derive likely domains from its canonical_name and probe
+    common feed URL patterns. Valid hits are persisted to the
+    ``discovered_source`` table so the next ``midas ingest ir`` pass
+    picks them up alongside the YAML bootstrap.
+    """
+    asyncio.run(
+        _discover_sources(
+            limit=limit,
+            discovered_only=discovered_only,
+            entity_filter=entity,
+            dry_run=dry_run,
+        ),
+    )
+
+
+async def _discover_sources(
+    *,
+    limit: int,
+    discovered_only: bool,
+    entity_filter: str | None,
+    dry_run: bool,
+) -> None:
+    import httpx
+    from sqlmodel import col, select
+
+    from midas.discovery.sources import discover_for_entity
+    from midas.models import DiscoveredSource, Entity
+
+    engine = make_engine()
+    try:
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            # Build the candidate set.
+            stmt = select(Entity)
+            if discovered_only:
+                stmt = stmt.where(col(Entity.discovered).is_(True))
+            entities = list((await session.execute(stmt)).scalars().all())
+            if entity_filter is not None:
+                ef = entity_filter.lower()
+                entities = [e for e in entities if ef in e.canonical_name.lower()]
+
+            # Skip entities that already have at least one validated source.
+            already = (
+                (
+                    await session.execute(
+                        select(DiscoveredSource.entity_id).where(
+                            DiscoveredSource.status == "valid",
+                        ),
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            done_ids = set(already)
+            candidates = [e for e in entities if e.id not in done_ids]
+            if len(candidates) > limit:
+                candidates = candidates[:limit]
+
+            typer.echo(
+                f"=== Discovering feeds for {len(candidates)} of {len(entities)} entities ===",
+            )
+            if not candidates:
+                typer.echo("Nothing to probe — every candidate already has a discovered source.")
+                return
+
+            ua = (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) midas/1.9.2 Safari/537.36"
+            )
+            new_rows: list[DiscoveredSource] = []
+            async with httpx.AsyncClient(
+                headers={"User-Agent": ua},
+                follow_redirects=True,
+            ) as client:
+                for ent in candidates:
+                    hits = await discover_for_entity(client, ent, max_results=1)
+                    if not hits:
+                        typer.echo(f"  ✗  {ent.canonical_name}")
+                        continue
+                    hit = hits[0]
+                    typer.echo(f"  ✓  {ent.canonical_name:<40}  {hit.feed_url}")
+                    new_rows.append(
+                        DiscoveredSource(
+                            entity_id=ent.id,
+                            feed_url=hit.feed_url,
+                            publisher=hit.publisher,
+                            source_type=hit.source_type,
+                            status="valid",
+                        ),
+                    )
+
+            typer.echo(f"\n{len(new_rows)} feed(s) discovered.")
+            if dry_run:
+                typer.echo("(dry-run; nothing written.)")
+                return
+            for row in new_rows:
+                session.add(row)
+            await session.commit()
+            typer.echo(f"Wrote {len(new_rows)} rows to discovered_source.")
+    finally:
+        await engine.dispose()
+
+
+@review_app.command("prune")
+def review_prune(
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Print plan only."),
+    ] = False,
+) -> None:
+    """Soft-delete discovered entities that violate the V1.9 filter rules.
+
+    The filter (:func:`midas.entity_resolution.is_extractable_entity_name`)
+    was tightened in V1.9.1 but pre-existing rows in the DB didn't get
+    cleaned up retroactively. This walks every discovered entity, runs
+    each through the current filter, and deletes the entity *plus its
+    incident deals + evidence_spans* if the filter would reject it now.
+
+    Use ``--dry-run`` first; the plan is printed either way.
+    """
+    asyncio.run(_review_prune(dry_run=dry_run))
+
+
+async def _review_prune(*, dry_run: bool) -> None:
+    from sqlalchemy import delete as sa_delete
+    from sqlmodel import col, or_, select
+
+    from midas.entity_resolution import is_extractable_entity_name
+    from midas.models import Deal, Entity, EvidenceSpan
+
+    engine = make_engine()
+    try:
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            discovered = list(
+                (
+                    await session.execute(
+                        select(Entity).where(col(Entity.discovered).is_(True)),
+                    )
+                )
+                .scalars()
+                .all(),
+            )
+            violators = [e for e in discovered if not is_extractable_entity_name(e.canonical_name)]
+
+            if not violators:
+                typer.echo("No violators — discovered set is clean.")
+                return
+
+            ent_ids = [e.id for e in violators]
+            deals = list(
+                (
+                    await session.execute(
+                        select(Deal).where(
+                            or_(
+                                col(Deal.from_entity_id).in_(ent_ids),
+                                col(Deal.to_entity_id).in_(ent_ids),
+                            ),
+                        ),
+                    )
+                )
+                .scalars()
+                .all(),
+            )
+            deal_ids = [d.id for d in deals]
+
+            typer.echo("=== Prune plan ===")
+            typer.echo(
+                f"  {len(violators)} entities → drop "
+                f"{len(deals)} incident deals + their evidence",
+            )
+            for ent in sorted(violators, key=lambda e: e.canonical_name):
+                typer.echo(f"  - {ent.canonical_name}")
+
+            if dry_run:
+                typer.echo("\n(dry-run; no changes written.)")
+                return
+
+            # Order: evidence → deals → entities (FK dependency).
+            if deal_ids:
+                await session.execute(
+                    sa_delete(EvidenceSpan).where(col(EvidenceSpan.deal_id).in_(deal_ids)),
+                )
+                await session.execute(
+                    sa_delete(Deal).where(col(Deal.id).in_(deal_ids)),
+                )
+            await session.execute(sa_delete(Entity).where(col(Entity.id).in_(ent_ids)))
+            await session.commit()
+            typer.echo(f"\nPruned {len(violators)} entities + {len(deals)} deals.")
+    finally:
+        await engine.dispose()
+
+
+# ---------- insights ----------
+
+
+insights_app = typer.Typer(
+    help="Investment-decision queries: who's getting paid by the labs, "
+    "how deep do the chains run.",
+    no_args_is_help=True,
+)
+app.add_typer(insights_app, name="insights")
+
+
+_DEFAULT_LAB_NAMES: tuple[str, ...] = (
+    "OpenAI",
+    "Anthropic",
+    "Microsoft Corporation",
+    "Alphabet Inc.",
+    "Amazon.com, Inc.",
+    "Meta Platforms, Inc.",
+    "NVIDIA Corporation",
+    "Oracle Corporation",
+)
+
+
+@insights_app.command("inflow")
+def insights_inflow(
+    payer: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--payer",
+            help=(
+                "Canonical name of a payer to include. Repeat for multiple. "
+                "Defaults to the major labs (OpenAI/Anthropic/Microsoft/Alphabet/"
+                "Amazon/Meta/NVIDIA/Oracle)."
+            ),
+        ),
+    ] = None,
+    limit: Annotated[
+        int,
+        typer.Option(help="Max rows to print."),
+    ] = 30,
+    as_of: Annotated[
+        str | None,
+        typer.Option("--as-of", help="ISO date — only consider deals on or before this."),
+    ] = None,
+) -> None:
+    """Rank entities by total inbound $ from a set of payers.
+
+    The default payer set is the major labs + hyperscalers, so this is
+    the "who's catching the AI-capex wave" view. Override with one or
+    more ``--payer`` to chase any other source of flows.
+    """
+    payers = tuple(payer) if payer else _DEFAULT_LAB_NAMES
+    as_of_date = date.fromisoformat(as_of) if as_of else None
+    asyncio.run(_insights_inflow(payers=payers, limit=limit, as_of=as_of_date))
+
+
+async def _insights_inflow(
+    *,
+    payers: tuple[str, ...],
+    limit: int,
+    as_of: date | None,
+) -> None:
+    from sqlmodel import col, select
+
+    from midas.graph.builder import build_graph
+    from midas.insights import inflow_ranking
+    from midas.models import Entity
+
+    engine = make_engine()
+    try:
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            # Resolve payer names → entity ids.
+            stmt = select(Entity).where(col(Entity.canonical_name).in_(payers))
+            payer_rows = list((await session.execute(stmt)).scalars().all())
+            if not payer_rows:
+                typer.echo(f"No payers matched any of {payers!r}.", err=True)
+                raise typer.Exit(code=1)
+            payer_ids = {e.id for e in payer_rows}
+
+            # Build the full transitive graph (every deal everywhere). The
+            # ranking restricts to edges *from* the payer set, so this is
+            # the right primitive even though it's "wider" than needed.
+            graph = await build_graph(session, as_of=as_of, expand_transitively=False)
+        rows = inflow_ranking(graph, payer_ids=payer_ids)
+
+        typer.echo(
+            f"=== Inflow ranking — top {min(limit, len(rows))} of "
+            f"{len(rows)} recipients ===",
+        )
+        typer.echo(f"Payers: {', '.join(e.canonical_name for e in payer_rows)}")
+        if as_of is not None:
+            typer.echo(f"as_of:  {as_of.isoformat()}")
+        typer.echo("")
+        typer.echo(f"  {'recipient':<48} {'total $':>14}  deals  payers")
+        typer.echo(f"  {'-' * 48} {'-' * 14}  -----  ------")
+        for row in rows[:limit]:
+            total = _fmt_amount(row.total_usd) if row.total_usd > 0 else "—"
+            payer_label = ",".join(row.payers)
+            if len(payer_label) > 30:
+                payer_label = payer_label[:27] + "..."
+            name = row.canonical_name
+            if len(name) > 47:
+                name = name[:44] + "..."
+            typer.echo(
+                f"  {name:<48} {total:>14}  {row.deal_count:>5}  {payer_label}",
+            )
+    finally:
+        await engine.dispose()
+
+
+@insights_app.command("chain")
+def insights_chain(
+    seed: Annotated[str, typer.Argument(help="Canonical name (or substring) of the seed entity.")],
+    max_hops: Annotated[
+        int,
+        typer.Option("--max-hops", help="How many BFS rings to traverse."),
+    ] = 3,
+    as_of: Annotated[
+        str | None,
+        typer.Option("--as-of", help="ISO date — only consider deals on or before this."),
+    ] = None,
+) -> None:
+    """BFS-walk the outbound chain from ``seed`` and print each ring.
+
+    Each hop lists the deals crossing into that ring, biggest-amount
+    first. Use this to chase: ``Anthropic → AWS → ??? → ???`` and see
+    where disclosed flows run out (i.e. where the next IR source needs
+    to be added).
+    """
+    as_of_date = date.fromisoformat(as_of) if as_of else None
+    asyncio.run(_insights_chain(seed=seed, max_hops=max_hops, as_of=as_of_date))
+
+
+async def _insights_chain(
+    *,
+    seed: str,
+    max_hops: int,
+    as_of: date | None,
+) -> None:
+    from sqlmodel import col, or_, select
+
+    from midas.graph.builder import build_graph
+    from midas.insights import outbound_chain
+    from midas.models import Entity
+
+    engine = make_engine()
+    try:
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            # Resolve seed by exact, then ilike-substring.
+            stmt = select(Entity).where(
+                or_(
+                    col(Entity.canonical_name) == seed,
+                    col(Entity.canonical_name).ilike(f"%{seed}%"),
+                ),
+            )
+            matches = list((await session.execute(stmt)).scalars().all())
+            if not matches:
+                typer.echo(f"No entity matched {seed!r}.", err=True)
+                raise typer.Exit(code=1)
+            if len(matches) > 1:
+                exact = [e for e in matches if e.canonical_name.lower() == seed.lower()]
+                if exact:
+                    seed_entity = exact[0]
+                else:
+                    typer.echo(
+                        f"Ambiguous {seed!r}: matched {len(matches)} entities. "
+                        f"First few: {[e.canonical_name for e in matches[:5]]}",
+                        err=True,
+                    )
+                    raise typer.Exit(code=2)
+            else:
+                seed_entity = matches[0]
+
+            graph = await build_graph(
+                session,
+                entity_ids={seed_entity.id},
+                as_of=as_of,
+                expand_transitively=True,
+            )
+        hops = outbound_chain(graph, seed_entity.id, max_hops=max_hops)
+
+        typer.echo(f"=== Outbound chain from {seed_entity.canonical_name} ===")
+        if as_of is not None:
+            typer.echo(f"as_of: {as_of.isoformat()}")
+        if not hops:
+            typer.echo("(no outbound deals)")
+            return
+        for hop in hops:
+            n = len(hop.edges)
+            total_disclosed = sum(
+                (e.amount_usd for e in hop.edges if e.amount_usd is not None),
+                start=Decimal("0"),
+            )
+            typer.echo(
+                f"\nHop {hop.hop}  ({n} deals, "
+                f"disclosed total {_fmt_amount(total_disclosed)})",
+            )
+            for e in hop.edges:
+                amt = _fmt_amount(e.amount_usd) if e.amount_usd is not None else "—"
+                desc = e.description[:80] + "…" if len(e.description) > 80 else e.description
+                typer.echo(
+                    f"  {e.from_name:<28} → {e.to_name:<32} {e.deal_type:<20} {amt:>14}  {desc}",
+                )
     finally:
         await engine.dispose()
 

@@ -172,3 +172,151 @@ entities:
     entity_type: private_company
     sector_tags: ["ai"]
     country: "US"
+
+  # ---------- V1.9.2 tier-2 beneficiaries ----------
+  # Where the labs' money actually lands: data-center power + cooling,
+  # silicon foundry support, hyperscaler hardware OEMs, AI-cloud
+  # specialists. Added so the chain-walker can resolve names like
+  # "Vertiv", "Schneider Electric", "Constellation Energy" instead
+  # of auto-creating them as discovered.
+
+  # Power utilities — Anthropic/AWS/OpenAI gigawatt agreements land here.
+  - canonical_name: "Constellation Energy"
+    aliases: ["Constellation Energy Corporation", "CEG"]
+    ticker: "CEG"
+    cik: "0001868275"
+    entity_type: public_company
+    sector_tags: ["energy", "nuclear"]
+    country: "US"
+
+  - canonical_name: "Talen Energy Corporation"
+    aliases: ["Talen Energy", "TLN"]
+    ticker: "TLN"
+    cik: "0001838359"
+    entity_type: public_company
+    sector_tags: ["energy"]
+    country: "US"
+
+  - canonical_name: "Vistra Corp."
+    aliases: ["Vistra", "VST"]
+    ticker: "VST"
+    cik: "0001692819"
+    entity_type: public_company
+    sector_tags: ["energy"]
+    country: "US"
+
+  # DC power + cooling — Vertiv, Schneider, Eaton.
+  - canonical_name: "Vertiv Holdings Co"
+    aliases: ["Vertiv", "Vertiv Holdings", "VRT"]
+    ticker: "VRT"
+    cik: "0001674101"
+    entity_type: public_company
+    sector_tags: ["datacenter", "infrastructure"]
+    country: "US"
+
+  - canonical_name: "Schneider Electric SE"
+    aliases: ["Schneider Electric", "Schneider"]
+    entity_type: public_company
+    sector_tags: ["datacenter", "infrastructure"]
+    country: "FR"
+
+  - canonical_name: "Eaton Corporation plc"
+    aliases: ["Eaton", "ETN"]
+    ticker: "ETN"
+    cik: "0001551182"
+    entity_type: public_company
+    sector_tags: ["datacenter", "infrastructure"]
+    country: "IE"
+
+  # Hardware OEMs / server vendors.
+  - canonical_name: "Dell Technologies Inc."
+    aliases: ["Dell", "Dell Technologies", "DELL"]
+    ticker: "DELL"
+    cik: "0001571996"
+    entity_type: public_company
+    sector_tags: ["ai", "hardware"]
+    country: "US"
+
+  - canonical_name: "Super Micro Computer, Inc."
+    aliases: ["Supermicro", "Super Micro", "SMCI"]
+    ticker: "SMCI"
+    cik: "0001375365"
+    entity_type: public_company
+    sector_tags: ["ai", "hardware"]
+    country: "US"
+
+  - canonical_name: "Hewlett Packard Enterprise Company"
+    aliases: ["HPE", "Hewlett Packard Enterprise"]
+    ticker: "HPE"
+    cik: "0001645590"
+    entity_type: public_company
+    sector_tags: ["ai", "hardware"]
+    country: "US"
+
+  - canonical_name: "Arista Networks, Inc."
+    aliases: ["Arista", "ANET"]
+    ticker: "ANET"
+    cik: "0001596532"
+    entity_type: public_company
+    sector_tags: ["ai", "networking"]
+    country: "US"
+
+  # Datacenter REITs / specialty cloud.
+  - canonical_name: "Equinix, Inc."
+    aliases: ["Equinix", "EQIX"]
+    ticker: "EQIX"
+    cik: "0001101239"
+    entity_type: public_company
+    sector_tags: ["datacenter"]
+    country: "US"
+
+  - canonical_name: "Digital Realty Trust, Inc."
+    aliases: ["Digital Realty", "DLR"]
+    ticker: "DLR"
+    cik: "0001297996"
+    entity_type: public_company
+    sector_tags: ["datacenter"]
+    country: "US"
+
+  # Foundry-adjacent equipment.
+  - canonical_name: "ASML Holding N.V."
+    aliases: ["ASML"]
+    ticker: "ASML"
+    cik: "0000937966"
+    entity_type: public_company
+    sector_tags: ["semiconductors"]
+    country: "NL"
+
+  - canonical_name: "Applied Materials, Inc."
+    aliases: ["Applied Materials", "AMAT"]
+    ticker: "AMAT"
+    cik: "0000006951"
+    entity_type: public_company
+    sector_tags: ["semiconductors"]
+    country: "US"
+
+  # Specialty AI infrastructure (mostly private; promoted from discovered).
+  - canonical_name: "Crusoe Energy Systems"
+    aliases: ["Crusoe", "Crusoe Energy"]
+    entity_type: private_company
+    sector_tags: ["ai", "datacenter", "energy"]
+    country: "US"
+
+  - canonical_name: "Lambda, Inc."
+    aliases: ["Lambda", "Lambda Labs"]
+    entity_type: private_company
+    sector_tags: ["ai", "cloud"]
+    country: "US"
+
+  # Foreign / strategic counterparties surfaced by the IR ingest.
+  - canonical_name: "SpaceX"
+    aliases: ["Space Exploration Technologies", "SpaceX Inc."]
+    entity_type: private_company
+    sector_tags: ["ai", "compute"]
+    country: "US"
+
+  - canonical_name: "Fluidstack"
+    aliases: ["Fluidstack Ltd"]
+    entity_type: private_company
+    sector_tags: ["ai", "infra"]
+    country: "GB"

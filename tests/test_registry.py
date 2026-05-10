@@ -51,9 +51,11 @@ def test_seed_yaml_has_pyramid_top() -> None:
 
 
 def test_seed_yaml_public_companies_have_cik() -> None:
+    # CIK is a US-SEC concept; non-US public cos (Schneider, Eaton, ASML, TSMC ADR
+    # entry, etc.) may legitimately lack one even when seeded as public_company.
     for e in parse_seed():
-        if e.entity_type == EntityType.PUBLIC_COMPANY:
-            assert e.cik is not None, f"public company {e.canonical_name} missing CIK"
+        if e.entity_type == EntityType.PUBLIC_COMPANY and e.country == "US":
+            assert e.cik is not None, f"US public company {e.canonical_name} missing CIK"
             assert len(e.cik) == 10, f"{e.canonical_name}: CIK must be 10-char zero-padded"
             assert e.cik.isdigit(), f"{e.canonical_name}: CIK must be all digits"
 

@@ -162,6 +162,11 @@ def test_filter_rejects_placeholder_prefix(name: str) -> None:
         "North Africa region",
         "Annual sponsors",
         "Conference attendees",
+        # V1.9.1 additions — learned from playwright ingest false-positives
+        "ChatGPT Futures Class of 2026 honorees",
+        "2025 Anthropic Fellows awardees",
+        "Grant recipients",
+        "Award nominees",
     ],
 )
 def test_filter_rejects_aggregate_suffix(name: str) -> None:
