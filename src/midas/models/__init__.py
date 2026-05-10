@@ -22,6 +22,7 @@ inputs (tests, repository internals).
 """
 
 from .deal import Deal
+from .discovered_source import DiscoveredSource
 from .entity import Entity
 from .evidence import EvidenceSpan
 from .source import Source
@@ -31,6 +32,7 @@ __all__ = [
     "Deal",
     "DealStatus",
     "DealType",
+    "DiscoveredSource",
     "Entity",
     "EntityType",
     "EvidenceSpan",

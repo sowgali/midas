@@ -81,3 +81,13 @@ sources:
     feed_url: "https://huggingface.co/blog/feed.xml"
     publisher: "Hugging Face Blog"
     source_type: blog
+
+  # NOTE: tier-2 sources (power utilities, DC infra, hardware OEMs, AI
+  # cloud) are NOT hand-curated here. They're auto-discovered: each
+  # ingest pass surfaces new counterparties via the open-world resolver,
+  # then ``midas discover sources`` probes a small set of heuristic
+  # URL patterns ({domain}/feed, /news/rss, /investors/rss, ...) and
+  # persists validated sources to the ``discovered_source`` DB table.
+  # ``midas ingest frontier`` runs the full loop: discover → ingest →
+  # resolve → discover again, until no new sources land. The YAML
+  # above is the *bootstrap* set — the rest grows automatically.
