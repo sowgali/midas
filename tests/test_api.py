@@ -294,8 +294,14 @@ def test_graph_aggregates_parallel_deals(client: TestClient, seed: _Seed) -> Non
     assert openai_to_acme["deal_types"] == ["partnership"]
 
 
-def test_graph_filters_by_sector(client: TestClient, seed: _Seed) -> None:
-    resp = client.get("/api/graph", params={"sector": "ai"})
+def test_graph_sector_filter_strict_mode_drops_off_sector_nodes(
+    client: TestClient, seed: _Seed,
+) -> None:
+    """``expand_transitively=False`` reproduces the old closed-world view."""
+    resp = client.get(
+        "/api/graph",
+        params={"sector": "ai", "expand_transitively": "false"},
+    )
     assert resp.status_code == 200
     body = resp.json()
     assert body["sector"] == "ai"
@@ -304,6 +310,21 @@ def test_graph_filters_by_sector(client: TestClient, seed: _Seed) -> None:
     assert node_ids == {str(seed.nvda_id), str(seed.openai_id)}
     edge_pairs = {(e["from_id"], e["to_id"]) for e in body["edges"]}
     assert edge_pairs == {(str(seed.nvda_id), str(seed.openai_id))}
+
+
+def test_graph_sector_filter_default_expands_transitively(
+    client: TestClient, seed: _Seed,
+) -> None:
+    """Default mode pulls Acme back in via the openai→acme partnership —
+    the sector filter seeds the graph but doesn't truncate the chain.
+    """
+    resp = client.get("/api/graph", params={"sector": "ai"})
+    assert resp.status_code == 200
+    body = resp.json()
+    node_ids = {n["id"] for n in body["nodes"]}
+    assert node_ids == {str(seed.nvda_id), str(seed.openai_id), str(seed.acme_id)}
+    edge_pairs = {(e["from_id"], e["to_id"]) for e in body["edges"]}
+    assert (str(seed.openai_id), str(seed.acme_id)) in edge_pairs
 
 
 def test_graph_filters_by_as_of(client: TestClient, seed: _Seed) -> None:

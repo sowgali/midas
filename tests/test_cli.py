@@ -201,11 +201,19 @@ def test_print_stats_renders_counters(monkeypatch: Any, capsys: Any) -> None:
 def test_graph_render_parses_args(runner: CliRunner, monkeypatch: Any, tmp_path: Path) -> None:
     captured: dict[str, Any] = {}
 
-    async def fake_render(sector: str | None, as_of: date | None, output: Path, title: str) -> None:
+    async def fake_render(
+        sector: str | None,
+        as_of: date | None,
+        output: Path,
+        title: str,
+        *,
+        expand: bool = True,
+    ) -> None:
         captured["sector"] = sector
         captured["as_of"] = as_of
         captured["output"] = output
         captured["title"] = title
+        captured["expand"] = expand
 
     monkeypatch.setattr("midas.cli._render_graph", fake_render)
 
@@ -231,6 +239,41 @@ def test_graph_render_parses_args(runner: CliRunner, monkeypatch: Any, tmp_path:
     assert captured["as_of"] == date(2025, 9, 1)
     assert captured["output"] == output
     assert captured["title"] == "AI cash flow"
+    # Default is transitive expansion on.
+    assert captured["expand"] is True
+
+
+def test_graph_render_strict_flag_disables_expansion(
+    runner: CliRunner,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    async def fake_render(
+        sector: str | None,
+        as_of: date | None,
+        output: Path,
+        title: str,
+        *,
+        expand: bool = True,
+    ) -> None:
+        captured["expand"] = expand
+
+    monkeypatch.setattr("midas.cli._render_graph", fake_render)
+
+    result = runner.invoke(
+        app,
+        [
+            "graph",
+            "render",
+            "--strict",
+            "--output",
+            str(tmp_path / "g.html"),
+        ],
+    )
+    assert result.exit_code == 0, result.stdout
+    assert captured["expand"] is False
 
 
 # ---------- reconcile ----------
@@ -270,10 +313,18 @@ def test_reconcile_apply_no_dry_run(runner: CliRunner, monkeypatch: Any) -> None
 def test_graph_render_defaults(runner: CliRunner, monkeypatch: Any) -> None:
     captured: dict[str, Any] = {}
 
-    async def fake_render(sector: str | None, as_of: date | None, output: Path, title: str) -> None:
+    async def fake_render(
+        sector: str | None,
+        as_of: date | None,
+        output: Path,
+        title: str,
+        *,
+        expand: bool = True,
+    ) -> None:
         captured["sector"] = sector
         captured["as_of"] = as_of
         captured["output"] = output
+        captured["expand"] = expand
 
     monkeypatch.setattr("midas.cli._render_graph", fake_render)
 
@@ -282,6 +333,7 @@ def test_graph_render_defaults(runner: CliRunner, monkeypatch: Any) -> None:
     assert captured["sector"] is None
     assert captured["as_of"] is None
     assert captured["output"] == Path("graph.html")
+    assert captured["expand"] is True
 
 
 # Quiet unused-import lint when individual tests are run.

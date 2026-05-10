@@ -640,10 +640,22 @@ def graph_render(
         str,
         typer.Option(help="Title shown in the rendered HTML."),
     ] = "midas",
+    strict: Annotated[
+        bool,
+        typer.Option(
+            "--strict/--transitive",
+            help=(
+                "Strict mode keeps only edges with BOTH endpoints inside the "
+                "sector filter; the default --transitive expansion BFS-walks "
+                "the deal graph so cash chains don't get truncated at the "
+                "filter boundary."
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Build the cash-flow graph and write it as interactive HTML."""
     as_of_date = date.fromisoformat(as_of) if as_of else None
-    asyncio.run(_render_graph(sector, as_of_date, output, title))
+    asyncio.run(_render_graph(sector, as_of_date, output, title, expand=not strict))
 
 
 async def _render_graph(
@@ -651,11 +663,18 @@ async def _render_graph(
     as_of: date | None,
     output: Path,
     title: str,
+    *,
+    expand: bool = True,
 ) -> None:
     engine = make_engine()
     try:
         async with AsyncSession(engine, expire_on_commit=False) as session:
-            graph = await build_graph(session, sector=sector, as_of=as_of)
+            graph = await build_graph(
+                session,
+                sector=sector,
+                as_of=as_of,
+                expand_transitively=expand,
+            )
         n_nodes = graph.number_of_nodes()
         n_edges = graph.number_of_edges()
         if n_nodes == 0:

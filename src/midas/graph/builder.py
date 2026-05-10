@@ -20,6 +20,7 @@ from collections.abc import Iterable
 from datetime import date
 
 import networkx as nx
+from sqlalchemy import or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import col, select
 
@@ -54,12 +55,60 @@ def _deal_edge_attrs(deal: Deal) -> dict[str, object]:
     }
 
 
+async def _expand_transitively(
+    session: AsyncSession,
+    seed: set[uuid.UUID],
+    *,
+    as_of: date | None = None,
+) -> set[uuid.UUID]:
+    """BFS-expand ``seed`` through the deal graph until no new endpoints emerge.
+
+    This is what fixes the V1.9 truncation bug: a sector or explicit-id
+    filter scopes *which entities the user cares about*, but the cash
+    chain we want to visualize keeps going — Alphabet → Wiz → (Wiz's
+    cloud-spend counterparties) → ... — even when downstream nodes have
+    no ``sector_tags`` (typical for newly-discovered entities).
+
+    Each iteration looks for deals that touch the current frontier on
+    either side, adds the *other* endpoint to the visited set, and
+    advances the frontier to those newly-found endpoints. Terminates at
+    leaves or once a cycle has been fully explored — the visited set
+    monotonically grows and frontier shrinks to ∅.
+
+    The ``as_of`` cutoff is applied during expansion so we don't reach
+    through deals that wouldn't be in the final graph anyway.
+    """
+    visited = set(seed)
+    frontier = set(seed)
+    while frontier:
+        stmt = select(Deal.from_entity_id, Deal.to_entity_id).where(
+            or_(
+                col(Deal.from_entity_id).in_(frontier),
+                col(Deal.to_entity_id).in_(frontier),
+            ),
+        )
+        if as_of is not None:
+            stmt = stmt.where(col(Deal.announced_at).is_not(None)).where(
+                col(Deal.announced_at) <= as_of,
+            )
+        result = await session.execute(stmt)
+        new_endpoints: set[uuid.UUID] = set()
+        for from_id, to_id in result.all():
+            new_endpoints.add(from_id)
+            new_endpoints.add(to_id)
+        new_endpoints -= visited
+        visited |= new_endpoints
+        frontier = new_endpoints
+    return visited
+
+
 async def build_graph(
     session: AsyncSession,
     *,
     sector: str | None = None,
     as_of: date | None = None,
     entity_ids: Iterable[uuid.UUID] | None = None,
+    expand_transitively: bool = True,
 ) -> nx.MultiDiGraph:
     """Build a :class:`networkx.MultiDiGraph` from the entity / deal tables.
 
@@ -77,23 +126,45 @@ async def build_graph(
     entity_ids:
         Restrict to this exact set of entities. Takes precedence over
         ``sector`` (they aren't intended to be combined).
+    expand_transitively:
+        When ``True`` (default) and a ``sector`` or ``entity_ids`` filter
+        is set, BFS-expand the seed set through the deal graph so every
+        node reachable from the seed (until leaves or cycles) is
+        included. Without this, edges with one endpoint outside the
+        sector / id filter are silently dropped — which is what
+        truncated the cash chain past discovered entities pre-V1.9.1.
+        Set to ``False`` for the strict closed-world view.
     """
-    # 1. Load the candidate entities.
+    # 1. Resolve the seed set from the user-provided filter.
+    seed_ids: set[uuid.UUID] | None
     if entity_ids is not None:
         ids_set = set(entity_ids)
         if not ids_set:
             return nx.MultiDiGraph()
-        ent_stmt = select(Entity).where(col(Entity.id).in_(ids_set))
+        seed_ids = ids_set
+    elif sector is not None:
+        ent_stmt = select(Entity)
+        ent_result = await session.execute(ent_stmt)
+        seed_ids = {e.id for e in ent_result.scalars().all() if sector in e.sector_tags}
+        if not seed_ids:
+            return nx.MultiDiGraph()
+    else:
+        seed_ids = None  # No filter at all.
+
+    # 2. Optionally expand the seed transitively through the deal graph
+    #    so chains don't get truncated at the filter boundary.
+    if seed_ids is not None and expand_transitively:
+        seed_ids = await _expand_transitively(session, seed_ids, as_of=as_of)
+
+    # 3. Load the entity rows for whatever set we ended up with.
+    if seed_ids is None:
+        ent_stmt = select(Entity)
         ent_result = await session.execute(ent_stmt)
         entities: list[Entity] = list(ent_result.scalars().all())
     else:
-        ent_stmt = select(Entity)
+        ent_stmt = select(Entity).where(col(Entity.id).in_(seed_ids))
         ent_result = await session.execute(ent_stmt)
-        all_entities = list(ent_result.scalars().all())
-        if sector is not None:
-            entities = [e for e in all_entities if sector in e.sector_tags]
-        else:
-            entities = all_entities
+        entities = list(ent_result.scalars().all())
 
     entity_id_set = {e.id for e in entities}
 
@@ -104,7 +175,9 @@ async def build_graph(
     if not entity_id_set:
         return graph
 
-    # 2. Load deals where BOTH endpoints are in the loaded set.
+    # 4. Load deals where BOTH endpoints are in the loaded set. After
+    #    transitive expansion this is no longer a truncation risk —
+    #    every counterparty reachable from the seed is in the set.
     deal_stmt = (
         select(Deal)
         .where(col(Deal.from_entity_id).in_(entity_id_set))

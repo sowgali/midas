@@ -202,12 +202,13 @@ async def test_build_graph_as_of_excludes_future_deals(db_session: AsyncSession)
     assert not graph.has_edge(nvda.id, anthropic.id)
 
 
-async def test_build_graph_sector_filters_entities_and_their_edges(
+async def test_build_graph_sector_filters_with_strict_truncates_off_sector_edges(
     db_session: AsyncSession,
 ) -> None:
+    """Strict mode (``expand_transitively=False``) — pre-V1.9.1 behaviour."""
     msft, openai, nvda, anthropic, _ = await _seed_four_entities_five_deals(db_session)
 
-    graph = await build_graph(db_session, sector="ai")
+    graph = await build_graph(db_session, sector="ai", expand_transitively=False)
 
     # Only the four AI-tagged entities; chevron is dropped.
     assert set(graph.nodes) == {msft.id, openai.id, nvda.id, anthropic.id}
@@ -219,10 +220,17 @@ async def test_build_graph_sector_filters_entities_and_their_edges(
         assert edge[1] in graph.nodes
 
 
-async def test_build_graph_entity_ids_filters_to_subset(db_session: AsyncSession) -> None:
+async def test_build_graph_entity_ids_strict_filters_to_subset(
+    db_session: AsyncSession,
+) -> None:
+    """Strict mode keeps the old closed-world subset semantics."""
     msft, openai, _nvda, _anthropic, _ = await _seed_four_entities_five_deals(db_session)
 
-    graph = await build_graph(db_session, entity_ids={msft.id, openai.id})
+    graph = await build_graph(
+        db_session,
+        entity_ids={msft.id, openai.id},
+        expand_transitively=False,
+    )
 
     # Only msft and openai land as nodes…
     assert set(graph.nodes) == {msft.id, openai.id}
@@ -242,3 +250,156 @@ async def test_build_graph_empty_entity_ids_returns_empty_graph(
     graph = await build_graph(db_session, entity_ids=set())
     assert graph.number_of_nodes() == 0
     assert graph.number_of_edges() == 0
+
+
+# ---------- transitive expansion ----------
+#
+# Pre-V1.9.1 the graph silently truncated any deal whose other endpoint
+# was outside the sector / id filter — most painful for discovered
+# entities (empty sector_tags by construction). These tests pin the
+# chain-preserving behavior and the strict opt-out.
+
+
+async def test_sector_filter_expands_transitively_to_off_sector_endpoints(
+    db_session: AsyncSession,
+) -> None:
+    """``sector="ai"`` keeps msft→chevron because msft is in the seed
+    even though chevron is tagged only ``energy``. That's the cash-chain
+    behaviour we want — the user filters by sector to *seed* the graph,
+    not to amputate it.
+    """
+    msft, openai, nvda, anthropic, _ = await _seed_four_entities_five_deals(db_session)
+    # chevron lives on the ``energy`` tag; locate it.
+    from sqlmodel import select as _select
+
+    from midas.models import Entity as _Entity
+
+    rows = await db_session.execute(_select(_Entity).where(_Entity.canonical_name == "Chevron"))
+    chevron = rows.scalars().one()
+
+    graph = await build_graph(db_session, sector="ai")
+
+    # All four AI entities + chevron pulled in transitively.
+    assert set(graph.nodes) == {msft.id, openai.id, nvda.id, anthropic.id, chevron.id}
+    # All five seeded deals survive — none truncated.
+    assert graph.number_of_edges() == 5
+    assert graph.has_edge(msft.id, chevron.id)
+
+
+async def test_strict_mode_still_truncates_at_sector_boundary(
+    db_session: AsyncSession,
+) -> None:
+    """``expand_transitively=False`` reproduces the old closed-world
+    behaviour for callers who explicitly want it.
+    """
+    msft, openai, nvda, anthropic, _ = await _seed_four_entities_five_deals(db_session)
+
+    graph = await build_graph(db_session, sector="ai", expand_transitively=False)
+
+    assert set(graph.nodes) == {msft.id, openai.id, nvda.id, anthropic.id}
+    # 4 AI-internal edges; msft→chevron dropped because chevron isn't in the set.
+    assert graph.number_of_edges() == 4
+    for u, v in graph.edges():
+        assert u in graph.nodes
+        assert v in graph.nodes
+
+
+async def test_entity_ids_expands_transitively_along_chain(
+    db_session: AsyncSession,
+) -> None:
+    """Seeded with just msft, the BFS pulls in openai (msft→openai), then
+    chevron (msft→chevron). nvda is also reached via openai (nvda→openai
+    is incoming on openai), and from there anthropic.
+    """
+    msft, openai, nvda, anthropic, _ = await _seed_four_entities_five_deals(db_session)
+
+    graph = await build_graph(db_session, entity_ids={msft.id})
+
+    # msft → openai (frontier 1) → nvda via inbound (frontier 2) → anthropic (frontier 3)
+    # plus chevron from frontier 0.
+    assert msft.id in graph.nodes
+    assert openai.id in graph.nodes
+    assert nvda.id in graph.nodes
+    assert anthropic.id in graph.nodes
+    # All 5 deals are visible since every endpoint is in the expanded set.
+    assert graph.number_of_edges() == 5
+
+
+async def test_transitive_expansion_respects_as_of_cutoff(
+    db_session: AsyncSession,
+) -> None:
+    """``as_of`` is applied during BFS, so a chain that only continues
+    via a future-dated deal stops at the cutoff.
+    """
+    msft, openai, nvda, anthropic, _ = await _seed_four_entities_five_deals(db_session)
+    # chevron located via canonical_name lookup.
+    from sqlmodel import select as _select
+
+    from midas.models import Entity as _Entity
+
+    rows = await db_session.execute(_select(_Entity).where(_Entity.canonical_name == "Chevron"))
+    chevron = rows.scalars().one()
+
+    # Cutoff before chevron deal (2026-02-01) and before nvda→anthropic
+    # (2025-03-01). Seed = msft.
+    graph = await build_graph(
+        db_session,
+        entity_ids={msft.id},
+        as_of=date(2024, 12, 31),
+    )
+
+    # msft → openai is 2023/2024, included.
+    # nvda reached via openai (nvda→openai is 2024-09-15, ≤ cutoff).
+    # anthropic only reachable via nvda→anthropic (2025-03-01) — past cutoff,
+    # so anthropic should NOT be expanded in.
+    assert msft.id in graph.nodes
+    assert openai.id in graph.nodes
+    assert nvda.id in graph.nodes
+    assert anthropic.id not in graph.nodes
+    assert chevron.id not in graph.nodes  # 2026 deal past cutoff
+
+
+async def test_transitive_expansion_terminates_on_cycle(
+    db_session: AsyncSession,
+) -> None:
+    """A back-edge between two seeded nodes shouldn't loop the BFS forever."""
+    a = Entity(
+        canonical_name="A",
+        entity_type=EntityType.PRIVATE_COMPANY,
+        sector_tags=["ai"],
+    )
+    b = Entity(
+        canonical_name="B",
+        entity_type=EntityType.PRIVATE_COMPANY,
+        sector_tags=[],  # off-sector, only reachable via expansion
+    )
+    c = Entity(
+        canonical_name="C",
+        entity_type=EntityType.PRIVATE_COMPANY,
+        sector_tags=[],
+    )
+    repo = EntityRepository(db_session)
+    for e in (a, b, c):
+        await repo.add(e)
+    deals = DealRepository(db_session)
+    # A → B → C → A (cycle) plus B → C (parallel edge).
+    for from_id, to_id in [(a.id, b.id), (b.id, c.id), (c.id, a.id), (b.id, c.id)]:
+        await deals.add(
+            Deal(
+                from_entity_id=from_id,
+                to_entity_id=to_id,
+                deal_type=DealType.INVESTMENT,
+                status=DealStatus.ANNOUNCED,
+                confidence=0.8,
+                description="cycle",
+                amount_usd=Decimal("1000000.00"),
+                announced_at=date(2024, 1, 1),
+            ),
+        )
+    await db_session.commit()
+
+    graph = await build_graph(db_session, sector="ai")  # seed = {A}
+
+    # Cycle expanded fully without hanging; both off-sector nodes pulled in.
+    assert set(graph.nodes) == {a.id, b.id, c.id}
+    assert graph.number_of_edges() == 4

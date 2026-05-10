@@ -71,6 +71,16 @@ async def get_graph(
         str | None,
         Query(description="Comma-separated entity ids; takes precedence over ``sector``."),
     ] = None,
+    expand_transitively: Annotated[
+        bool,
+        Query(
+            description=(
+                "BFS-expand the seed set through deals so chains aren't truncated "
+                "at the sector / entity_ids boundary. Defaults to True; set False "
+                "for the strict closed-world view."
+            ),
+        ),
+    ] = True,
 ) -> GraphResponse:
     """Build the cash-flow graph and return its nodes + aggregated edges."""
     parsed_ids = _parse_entity_ids(entity_ids)
@@ -80,6 +90,7 @@ async def get_graph(
         sector=sector,
         as_of=as_of,
         entity_ids=parsed_ids,
+        expand_transitively=expand_transitively,
     )
 
     # Per-pair distinct ``deal_type`` values (the aggregated DiGraph drops them).
