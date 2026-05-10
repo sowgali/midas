@@ -131,6 +131,57 @@ def test_filter_rejects_lowercase_single_word() -> None:
     assert not is_extractable_entity_name("creditors")
 
 
+# V1.9 false-positive cleanup — learned from observed HF blog
+# extractions that slipped through V1.8's filter.
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "Undisclosed investors",
+        "Undisclosed Investor",
+        "Unspecified IMO gold medal AI winner",
+        "Unnamed party",
+        "Anonymous donor",
+        "Various investors",
+    ],
+)
+def test_filter_rejects_placeholder_prefix(name: str) -> None:
+    assert not is_extractable_entity_name(name), f"should reject: {name!r}"
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "1st Place Winner",
+        "2nd Place Winner",
+        "3rd Place Winner",
+        "Top Student Participants",
+        "FilBench authors",
+        "Survey respondents",
+        "North Africa region",
+        "Annual sponsors",
+        "Conference attendees",
+    ],
+)
+def test_filter_rejects_aggregate_suffix(name: str) -> None:
+    assert not is_extractable_entity_name(name), f"should reject: {name!r}"
+
+
+def test_filter_still_passes_borderline_real_entities() -> None:
+    """The new aggregate-suffix rule must NOT reject real orgs that
+    happen to have a similar-shaped tail.
+    """
+    # "Winners Inc." would canonically be a single-token thing if anyone
+    # named a company that — we're filtering on the last *word*.
+    assert is_extractable_entity_name("Together AI")
+    assert is_extractable_entity_name("DeepSeek")
+    assert is_extractable_entity_name("Sequoia Capital")
+    assert is_extractable_entity_name("U.S. Government")
+    # Government / nonprofit-shaped: keep, human-review can reclassify.
+    assert is_extractable_entity_name("European Commission")
+
+
 # ---------- EntityResolver: in-memory exact + normalized match ----------
 
 

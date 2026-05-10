@@ -103,6 +103,58 @@ def normalize_entity_name(name: str) -> str:
 
 # ---------- Quality filter ----------
 
+# Strings that look like an entity name when read alone but aren't.
+# Two layers: exact-string blacklist + structural patterns. Both
+# learned from observed false positives in the V1.8 demo run on
+# Hugging Face's blog corpus (e.g. "Undisclosed investors", "1st
+# Place Winner", "EduRénov program (public school renovation projects)").
+
+# A *first word* in this set means the whole string is a placeholder.
+_PLACEHOLDER_PREFIX_TOKENS: frozenset[str] = frozenset(
+    {
+        "undisclosed",
+        "unspecified",
+        "unnamed",
+        "anonymous",
+        "various",  # "various investors"
+    },
+)
+
+# A *last word* in this set means the string names a *role* or
+# *aggregate* of people / orgs, not a counterparty.
+_AGGREGATE_SUFFIX_TOKENS: frozenset[str] = frozenset(
+    {
+        # Competition placements
+        "winner",
+        "winners",
+        "finalist",
+        "finalists",
+        "entrant",
+        "entrants",
+        "participant",
+        "participants",
+        "candidates",
+        "candidate",
+        # Authorship roles
+        "authors",
+        "author",
+        "co-authors",
+        "contributors",
+        "contributor",
+        "researchers",
+        "researcher",
+        # Geo / generic groupings
+        "region",
+        "respondents",
+        "respondent",
+        "attendees",
+        "attendee",
+        "sponsors",
+        "sponsor",
+    },
+)
+
+
 # Generic referents that the LLM occasionally emits as a "party" but
 # which don't represent a real counterparty.
 _GENERIC_NON_ENTITIES: frozenset[str] = frozenset(
@@ -198,6 +250,15 @@ def is_extractable_entity_name(name: str) -> bool:
     # Must contain at least one alphabetic character.
     if not any(c.isalpha() for c in s):
         return False
+
+    tokens = s.split()
+    # Reject "Undisclosed *", "Unspecified *", "Various *".
+    if tokens and tokens[0].lower() in _PLACEHOLDER_PREFIX_TOKENS:
+        return False
+    # Reject "* Winner(s)", "* Participants", "* Authors", "* Region".
+    if tokens and tokens[-1].lower().rstrip(",.") in _AGGREGATE_SUFFIX_TOKENS:
+        return False
+
     # All-lowercase single words are usually generic ("vendors",
     # "creditors"). Real company names have at least one capital, or
     # are multi-word, or include an acronym chunk.
