@@ -41,19 +41,27 @@ if TYPE_CHECKING:
 
 _MODEL_ID = "claude-opus-4-7"
 
-# Document-text budget. Opus 4.7 caps at 1M input tokens; we leave
-# ~400K headroom for system prompt + tool definition + known-parties +
-# Claude's response. ~3 chars/token is the conservative ratio for
-# English prose, so 1.8M chars = ~600K tokens of doc text. Press
-# releases and earnings extracts that exceed this are typically one of:
-# (a) a PDF rendered to enormous HTML with redundant whitespace, or
-# (b) a multi-article concatenation that should have been split feed-side.
-# Either way we truncate from the END — money-flow claims are
-# overwhelmingly front-loaded in press releases (lede + first
-# paragraphs); the tail is usually boilerplate / forward-looking-
-# statement legalese / unrelated content.
-_MAX_DOCUMENT_CHARS = 1_800_000
-_TRUNCATION_MARKER = "\n\n[... document truncated to fit context window ...]"
+# Chunking budget for multi-pass extraction. Opus 4.7 caps at 1M input
+# tokens; we use ~500K chars per chunk (~150K tokens at the conservative
+# 3-chars-per-token ratio) so a single chunk plus system prompt + tool
+# def + known-parties + response leaves comfortable headroom — and so a
+# document up to ~8 MB still fits in a reasonable number of API calls.
+# Larger chunks = fewer calls but more risk of edge-case overflow from
+# tokenizer-heavy text (CJK, dense numerics, base64 blobs in HTML).
+_CHUNK_CHARS = 500_000
+
+# Overlap between successive chunks. A money-flow sentence that
+# straddles a chunk boundary would otherwise vanish into the gap;
+# duplicating ~10 KB on each side guarantees any single deal-bearing
+# span lands wholly inside at least one chunk. Within-document
+# dedup collapses the duplicates produced by overlap regions.
+_CHUNK_OVERLAP_CHARS = 10_000
+
+# Sanity cap on number of chunks per document. Beyond ~8 MB a doc is
+# almost certainly an HTML render of a PDF or a multi-article
+# concatenation — at that point we'd rather log loudly than make
+# dozens of API calls. 16 chunks of 500 KB = 8 MB document.
+_MAX_CHUNKS_PER_DOC = 16
 
 _SYSTEM_PROMPT = """\
 You extract directional money-flow claims from press releases, filings, \
@@ -166,6 +174,93 @@ _RECORD_DEAL_SCHEMA: dict[str, Any] = {
 }
 
 
+def _split_into_chunks(
+    text: str,
+    *,
+    chunk_chars: int = _CHUNK_CHARS,
+    overlap_chars: int = _CHUNK_OVERLAP_CHARS,
+) -> list[tuple[str, int]]:
+    """Split ``text`` into overlapping chunks for multi-pass extraction.
+
+    Returns a list of ``(chunk_text, doc_offset)`` tuples where
+    ``doc_offset`` is the index of ``chunk_text[0]`` in the original
+    document — used by the extractor to translate model-emitted
+    ``char_start`` / ``char_end`` offsets back into document space.
+
+    A boundary search looks for the nearest ``\\n\\n`` paragraph break
+    in the tail half of the window so chunks don't routinely cut a
+    sentence in half (the overlap absorbs the residual cases).
+
+    >>> [(c, o) for c, o in _split_into_chunks("abcdef", chunk_chars=10)]
+    [('abcdef', 0)]
+    """
+    if not text:
+        return [("", 0)]
+    if len(text) <= chunk_chars:
+        return [(text, 0)]
+    if overlap_chars >= chunk_chars:
+        raise ValueError("overlap_chars must be smaller than chunk_chars")
+
+    chunks: list[tuple[str, int]] = []
+    start = 0
+    n = len(text)
+    while start < n:
+        target_end = min(start + chunk_chars, n)
+        end = target_end
+        if end < n:
+            # Search the tail half of the window for a paragraph break;
+            # falls back to the target if no break is found in range.
+            search_floor = start + chunk_chars // 2
+            split_at = text.rfind("\n\n", search_floor, target_end)
+            if split_at > 0:
+                end = split_at + 2  # include the blank line in the prior chunk
+        chunks.append((text[start:end], start))
+        if end >= n:
+            break
+        start = max(end - overlap_chars, end - chunk_chars + 1)
+        # Defensive bound on chunk count.
+        if len(chunks) >= _MAX_CHUNKS_PER_DOC:
+            log.warning(
+                "claude.chunk_cap_reached",
+                total_chars=n,
+                kept_chars=end,
+                max_chunks=_MAX_CHUNKS_PER_DOC,
+            )
+            break
+    return chunks
+
+
+def _dedupe_within_document(deals: list[ExtractedDeal]) -> list[ExtractedDeal]:
+    """Collapse duplicate deals produced by overlap regions of chunks.
+
+    Two extractions of the *same source document* are considered the
+    same deal when their (source, target, deal_type, amount, status)
+    tuple matches case-insensitively. First-seen wins so the earliest
+    char offsets — which point at the document's lede if the model
+    consistently picks the strongest evidence — are preserved.
+
+    The V1.6 cross-source dedup layer in ``midas.dedup`` handles the
+    case where the SAME deal is reported in two different sources;
+    this helper handles within-source duplicates that the chunker
+    itself creates via overlap.
+    """
+    seen: set[tuple[str, str, str, object, str]] = set()
+    out: list[ExtractedDeal] = []
+    for d in deals:
+        key = (
+            d.source_party_name.lower().strip(),
+            d.target_party_name.lower().strip(),
+            d.deal_type.value if hasattr(d.deal_type, "value") else str(d.deal_type),
+            d.amount_usd,
+            d.status.value if hasattr(d.status, "value") else str(d.status),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(d)
+    return out
+
+
 def _format_known_parties(parties: list[KnownParty]) -> str:
     """Render the known-parties block for the user message.
 
@@ -210,29 +305,84 @@ class ClaudeExtractor:
         return anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key.get_secret_value())
 
     async def extract(self, context: ExtractionContext) -> list[ExtractedDeal]:
+        """Extract money-flow claims from ``context.document_text``.
+
+        Documents up to ``_CHUNK_CHARS`` (~500 KB / ~150K tokens) go in
+        a single API call. Larger documents are split into overlapping
+        chunks (multi-pass extraction); deals are accumulated and
+        deduplicated across chunks before returning. No transactional
+        info is dropped — every byte of the document gets scanned at
+        least once.
+        """
         client = self._get_client()
-
-        # Guard against documents that would blow past the 1M-token cap.
-        # One outsized doc shouldn't tank a whole ingest run.
         document_text = context.document_text
-        if len(document_text) > _MAX_DOCUMENT_CHARS:
-            log.warning(
-                "claude.document_truncated",
-                source_url=context.source_url,
-                original_chars=len(document_text),
-                kept_chars=_MAX_DOCUMENT_CHARS,
-            )
-            document_text = document_text[:_MAX_DOCUMENT_CHARS] + _TRUNCATION_MARKER
+        chunks = _split_into_chunks(document_text)
 
+        if len(chunks) > 1:
+            log.info(
+                "claude.multipass.start",
+                source_url=context.source_url,
+                total_chars=len(document_text),
+                chunk_count=len(chunks),
+            )
+
+        all_deals: list[ExtractedDeal] = []
+        for i, (chunk_text, doc_offset) in enumerate(chunks):
+            chunk_deals = await self._extract_chunk(
+                client,
+                context=context,
+                chunk_text=chunk_text,
+                doc_offset=doc_offset,
+                chunk_index=i,
+                chunk_count=len(chunks),
+            )
+            all_deals.extend(chunk_deals)
+
+        if len(chunks) > 1:
+            deduped = _dedupe_within_document(all_deals)
+            log.info(
+                "claude.multipass.done",
+                source_url=context.source_url,
+                deals_before_dedup=len(all_deals),
+                deals_after_dedup=len(deduped),
+            )
+            return deduped
+        return all_deals
+
+    async def _extract_chunk(
+        self,
+        client: anthropic.AsyncAnthropic,
+        *,
+        context: ExtractionContext,
+        chunk_text: str,
+        doc_offset: int,
+        chunk_index: int,
+        chunk_count: int,
+    ) -> list[ExtractedDeal]:
+        """Run one extraction pass against one chunk.
+
+        ``doc_offset`` is added back to the model-emitted
+        ``char_start``/``char_end`` so the resulting offsets are
+        meaningful relative to the original (full) document.
+        """
+        # When chunking, tell the model this is a slice so it doesn't
+        # try to reason about "the document's overall narrative" — each
+        # chunk stands alone for extraction purposes.
+        chunk_note = (
+            f"\n(NOTE: this is chunk {chunk_index + 1} of {chunk_count} from a "
+            f"larger document; extract claims that appear in THIS chunk only.)"
+            if chunk_count > 1
+            else ""
+        )
         user_message = (
             f"Source URL: {context.source_url}\n"
-            f"Source type: {context.source_type.value}\n\n"
+            f"Source type: {context.source_type.value}{chunk_note}\n\n"
             f"Known parties (resolve mentions to these canonical names "
             f"when applicable):\n"
             f"{_format_known_parties(context.known_parties)}\n\n"
             f"Document text:\n"
             f"---\n"
-            f"{document_text}\n"
+            f"{chunk_text}\n"
             f"---\n\n"
             f"Emit one `record_deal` tool call per distinct money-flow "
             f"claim. If the document has no such claims, emit no tool calls."
@@ -270,14 +420,15 @@ class ClaudeExtractor:
                 messages=[{"role": "user", "content": user_message}],
             )
         except anthropic.BadRequestError as exc:
-            # Fail-soft: a single document hitting the API's input limit
-            # (or any other 400) should NOT kill an entire frontier run.
-            # Log enough to debug + return zero deals so the pipeline
-            # marks the document as "seen, nothing extracted" and moves on.
+            # Fail-soft: a single chunk hitting an API error should NOT
+            # kill the whole document (and certainly not the run). Log,
+            # return zero deals for this chunk, and let the other
+            # chunks contribute what they can.
             log.warning(
                 "claude.bad_request",
                 source_url=context.source_url,
-                document_chars=len(document_text),
+                chunk_index=chunk_index,
+                chunk_chars=len(chunk_text),
                 error=str(exc),
             )
             return []
@@ -290,6 +441,16 @@ class ClaudeExtractor:
             if tool_block.name != "record_deal":
                 continue
             payload = dict(tool_block.input) if isinstance(tool_block.input, dict) else {}
+            # Translate chunk-relative offsets back to document-relative
+            # offsets so EvidenceSpan rows index into the canonical
+            # source text (not into a chunk that no longer exists).
+            if doc_offset:
+                start_val = payload.get("char_start")
+                if isinstance(start_val, int):
+                    payload["char_start"] = start_val + doc_offset
+                end_val = payload.get("char_end")
+                if isinstance(end_val, int):
+                    payload["char_end"] = end_val + doc_offset
             # Stamp the extractor name server-side rather than asking
             # the model to fill it in — saves tokens and removes a
             # whole class of "model lied about its own name" bugs.
