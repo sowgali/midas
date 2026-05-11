@@ -24,7 +24,7 @@ worth the marginal recall.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import anthropic
 import structlog
@@ -35,9 +35,6 @@ from midas.config import settings
 from .base import ExtractedDeal, ExtractionContext, KnownParty
 
 log = structlog.get_logger(__name__)
-
-if TYPE_CHECKING:
-    from anthropic.types import ToolUseBlock
 
 _MODEL_ID = "claude-opus-4-7"
 
@@ -280,6 +277,123 @@ def _format_known_parties(parties: list[KnownParty]) -> str:
     return "\n".join(lines)
 
 
+def _build_user_message(
+    *,
+    context: ExtractionContext,
+    chunk_text: str,
+    chunk_index: int,
+    chunk_count: int,
+) -> str:
+    """Render the per-request user message.
+
+    Shared by the real-time and batch extractors so the prompt shape
+    stays in lockstep (a divergence here would cause caching misses
+    and silent extraction-quality drift between paths).
+    """
+    chunk_note = (
+        f"\n(NOTE: this is chunk {chunk_index + 1} of {chunk_count} from a "
+        f"larger document; extract claims that appear in THIS chunk only.)"
+        if chunk_count > 1
+        else ""
+    )
+    return (
+        f"Source URL: {context.source_url}\n"
+        f"Source type: {context.source_type.value}{chunk_note}\n\n"
+        f"Known parties (resolve mentions to these canonical names "
+        f"when applicable):\n"
+        f"{_format_known_parties(context.known_parties)}\n\n"
+        f"Document text:\n"
+        f"---\n"
+        f"{chunk_text}\n"
+        f"---\n\n"
+        f"Emit one `record_deal` tool call per distinct money-flow "
+        f"claim. If the document has no such claims, emit no tool calls."
+    )
+
+
+def _build_request_params(
+    *,
+    model: str,
+    user_message: str,
+    max_tokens: int = 4096,
+) -> dict[str, Any]:
+    """Build the kwargs dict for messages.create() (or its batch equivalent).
+
+    Cache placement: system prompt and tool definition are the stable
+    prefix shared across every extraction call. ``cache_control`` lands
+    on both so the SDK caches them (stable bytes first, volatile bytes
+    after, per the prompt-caching guidance).
+    """
+    return {
+        "model": model,
+        "max_tokens": max_tokens,
+        "system": [
+            {
+                "type": "text",
+                "text": _SYSTEM_PROMPT,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ],
+        "tools": [
+            {
+                "name": "record_deal",
+                "description": (
+                    "Record a single directional money-flow claim from "
+                    "the document. Call once per distinct deal."
+                ),
+                "input_schema": _RECORD_DEAL_SCHEMA,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ],
+        "messages": [{"role": "user", "content": user_message}],
+    }
+
+
+def _parse_tool_uses(
+    content_blocks: list[Any],
+    *,
+    doc_offset: int,
+    extractor_name: str,
+) -> list[ExtractedDeal]:
+    """Walk a response's content blocks; yield validated ``ExtractedDeal``s.
+
+    ``doc_offset`` is added to model-emitted ``char_start``/``char_end``
+    so offsets are document-relative (not chunk-relative). Validation
+    failures on a single tool_use are logged and skipped — surviving
+    deals in the same response still surface.
+
+    Pulled out into a module-level helper so both the real-time and
+    batch extractors apply identical parsing semantics; otherwise it's
+    easy for the batch path to drift on (say) the offset translation.
+    """
+    deals: list[ExtractedDeal] = []
+    for block in content_blocks:
+        if getattr(block, "type", None) != "tool_use":
+            continue
+        if getattr(block, "name", None) != "record_deal":
+            continue
+        raw_input = getattr(block, "input", None)
+        payload = dict(raw_input) if isinstance(raw_input, dict) else {}
+        if doc_offset:
+            start_val = payload.get("char_start")
+            if isinstance(start_val, int):
+                payload["char_start"] = start_val + doc_offset
+            end_val = payload.get("char_end")
+            if isinstance(end_val, int):
+                payload["char_end"] = end_val + doc_offset
+        payload["extractor_name"] = extractor_name
+        try:
+            deals.append(ExtractedDeal.model_validate(payload))
+        except ValidationError as exc:
+            log.warning(
+                "claude.invalid_tool_use",
+                error=str(exc),
+                payload_keys=sorted(payload.keys()),
+            )
+            continue
+    return deals
+
+
 class ClaudeExtractor:
     """LLM extractor backed by ``claude-opus-4-7`` via the Anthropic SDK."""
 
@@ -365,60 +479,15 @@ class ClaudeExtractor:
         ``char_start``/``char_end`` so the resulting offsets are
         meaningful relative to the original (full) document.
         """
-        # When chunking, tell the model this is a slice so it doesn't
-        # try to reason about "the document's overall narrative" — each
-        # chunk stands alone for extraction purposes.
-        chunk_note = (
-            f"\n(NOTE: this is chunk {chunk_index + 1} of {chunk_count} from a "
-            f"larger document; extract claims that appear in THIS chunk only.)"
-            if chunk_count > 1
-            else ""
+        user_message = _build_user_message(
+            context=context,
+            chunk_text=chunk_text,
+            chunk_index=chunk_index,
+            chunk_count=chunk_count,
         )
-        user_message = (
-            f"Source URL: {context.source_url}\n"
-            f"Source type: {context.source_type.value}{chunk_note}\n\n"
-            f"Known parties (resolve mentions to these canonical names "
-            f"when applicable):\n"
-            f"{_format_known_parties(context.known_parties)}\n\n"
-            f"Document text:\n"
-            f"---\n"
-            f"{chunk_text}\n"
-            f"---\n\n"
-            f"Emit one `record_deal` tool call per distinct money-flow "
-            f"claim. If the document has no such claims, emit no tool calls."
-        )
-
-        # Cache placement: the system prompt and the tool definition are
-        # the stable prefix shared across every extraction call. We mark
-        # cache_control on the last system block and on the (single)
-        # tool definition. The SDK renders tools → system → messages, so
-        # both ranges land before the per-document user message and
-        # cache cleanly. Per the prompt-caching guidance: stable bytes
-        # first, volatile bytes after.
+        params = _build_request_params(model=self._model, user_message=user_message)
         try:
-            response = await client.messages.create(
-                model=self._model,
-                max_tokens=4096,
-                system=[
-                    {
-                        "type": "text",
-                        "text": _SYSTEM_PROMPT,
-                        "cache_control": {"type": "ephemeral"},
-                    }
-                ],
-                tools=[
-                    {
-                        "name": "record_deal",
-                        "description": (
-                            "Record a single directional money-flow claim "
-                            "from the document. Call once per distinct deal."
-                        ),
-                        "input_schema": _RECORD_DEAL_SCHEMA,
-                        "cache_control": {"type": "ephemeral"},
-                    }
-                ],
-                messages=[{"role": "user", "content": user_message}],
-            )
+            response = await client.messages.create(**params)
         except anthropic.BadRequestError as exc:
             # Fail-soft: a single chunk hitting an API error should NOT
             # kill the whole document (and certainly not the run). Log,
@@ -432,41 +501,8 @@ class ClaudeExtractor:
                 error=str(exc),
             )
             return []
-
-        deals: list[ExtractedDeal] = []
-        for block in response.content:
-            if block.type != "tool_use":
-                continue
-            tool_block: ToolUseBlock = block
-            if tool_block.name != "record_deal":
-                continue
-            payload = dict(tool_block.input) if isinstance(tool_block.input, dict) else {}
-            # Translate chunk-relative offsets back to document-relative
-            # offsets so EvidenceSpan rows index into the canonical
-            # source text (not into a chunk that no longer exists).
-            if doc_offset:
-                start_val = payload.get("char_start")
-                if isinstance(start_val, int):
-                    payload["char_start"] = start_val + doc_offset
-                end_val = payload.get("char_end")
-                if isinstance(end_val, int):
-                    payload["char_end"] = end_val + doc_offset
-            # Stamp the extractor name server-side rather than asking
-            # the model to fill it in — saves tokens and removes a
-            # whole class of "model lied about its own name" bugs.
-            payload["extractor_name"] = self.name
-            try:
-                deals.append(ExtractedDeal.model_validate(payload))
-            except ValidationError as exc:
-                # One bad tool_use shouldn't tank the whole document —
-                # extractors are best-effort. Log enough to surface
-                # systematic schema drift later without blocking the
-                # rest of the deals the model recovered.
-                log.warning(
-                    "claude.invalid_tool_use",
-                    error=str(exc),
-                    payload_keys=sorted(payload.keys()),
-                )
-                continue
-
-        return deals
+        return _parse_tool_uses(
+            list(response.content),
+            doc_offset=doc_offset,
+            extractor_name=self.name,
+        )

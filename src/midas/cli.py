@@ -71,13 +71,25 @@ app.add_typer(graph_app, name="graph")
 # ---------- Helpers ----------
 
 
-def _build_extractor(name: str) -> Extractor:
-    """Lazy-build an extractor; deferred imports keep ``midas version`` fast."""
+def _build_extractor(name: str, *, batch: bool = False) -> Extractor:
+    """Lazy-build an extractor; deferred imports keep ``midas version`` fast.
+
+    ``batch=True`` swaps the Claude path for :class:`BatchClaudeExtractor`,
+    which submits requests via Anthropic's Message Batches API for a
+    ~50% cost saving in exchange for minutes of latency. Has no effect
+    on the regex extractor.
+    """
     if name == "regex":
         from midas.extractors.regex import RegexExtractor
 
+        if batch:
+            log.warning("cli.batch_ignored_for_regex")
         return RegexExtractor()
     if name == "claude":
+        if batch:
+            from midas.extractors.claude_batch import BatchClaudeExtractor
+
+            return BatchClaudeExtractor()
         from midas.extractors.claude import ClaudeExtractor
 
         return ClaudeExtractor()
@@ -194,10 +206,18 @@ def ingest_sec(
         str,
         typer.Option("--extractor", help="Extractor: 'regex' (default, free) or 'claude'."),
     ] = "regex",
+    batch: Annotated[
+        bool,
+        typer.Option(
+            "--batch",
+            help="Use Anthropic Message Batches API for Claude (~50%% cheaper, async). "
+            "Ignored for the regex extractor.",
+        ),
+    ] = False,
 ) -> None:
     """Fetch SEC EDGAR filings, extract deals, persist."""
     since_date = date.fromisoformat(since) if since else None
-    extractor = _build_extractor(extractor_name)
+    extractor = _build_extractor(extractor_name, batch=batch)
     asyncio.run(_ingest_sec(ticker, since_date, list(forms), extractor))
 
 
@@ -240,10 +260,18 @@ def ingest_ir(
         str,
         typer.Option("--extractor", help="Extractor: 'regex' (default, free) or 'claude'."),
     ] = "regex",
+    batch: Annotated[
+        bool,
+        typer.Option(
+            "--batch",
+            help="Use Anthropic Message Batches API for Claude (~50%% cheaper, async). "
+            "Ignored for the regex extractor.",
+        ),
+    ] = False,
 ) -> None:
     """Fetch IR / news / blog feeds, extract deals, persist."""
     since_date = date.fromisoformat(since) if since else None
-    extractor = _build_extractor(extractor_name)
+    extractor = _build_extractor(extractor_name, batch=batch)
     asyncio.run(_ingest_ir(entity, since_date, extractor))
 
 
@@ -567,6 +595,14 @@ def discover_frontier(
         str | None,
         typer.Option(help="ISO date — only ingest items on/after this."),
     ] = None,
+    batch: Annotated[
+        bool,
+        typer.Option(
+            "--batch",
+            help="Use Anthropic Message Batches API for Claude (~50%% cheaper, async). "
+            "Ignored for the regex extractor.",
+        ),
+    ] = False,
 ) -> None:
     """Run the V1.9.2 BFS frontier loop until convergence.
 
@@ -584,7 +620,7 @@ def discover_frontier(
     actually extract deals.
     """
     since_date = date.fromisoformat(since) if since else None
-    extractor = _build_extractor(extractor_name)
+    extractor = _build_extractor(extractor_name, batch=batch)
     asyncio.run(
         _discover_frontier(
             max_rounds=max_rounds,

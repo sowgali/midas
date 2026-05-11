@@ -8,9 +8,11 @@ implementing the :class:`Extractor` Protocol from :mod:`.base`.
 
 from .base import ExtractedDeal, ExtractionContext, Extractor, KnownParty
 from .claude import ClaudeExtractor
+from .claude_batch import BatchClaudeExtractor
 from .regex import RegexExtractor
 
 __all__ = [
+    "BatchClaudeExtractor",
     "ClaudeExtractor",
     "ExtractedDeal",
     "ExtractionContext",

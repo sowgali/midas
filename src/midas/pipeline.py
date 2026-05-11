@@ -21,6 +21,7 @@ import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import date
+from typing import Any
 
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -89,32 +90,17 @@ class IngestStats:
 # ---------- Core unit: one document -> deals ----------
 
 
-async def ingest_raw_document(
-    *,
+async def _upsert_source_and_parse(
     session: AsyncSession,
     raw: RawDocument,
-    extractor: Extractor,
-    resolver: EntityResolver,
-    parser: Parser | None = None,
-) -> IngestStats:
-    """Persist one fetched document end-to-end.
+    parser: Parser | None,
+) -> tuple[Source, str, bool]:
+    """Upsert the Source row and parse raw bytes to clean prose.
 
-    Idempotent at the Source level (via ``content_sha256`` upsert); when
-    the same document is ingested twice the second call is mostly a
-    no-op for sources but will re-run extraction and re-insert deals.
-    Deal-level dedup is deferred to V1.5.
-
-    The optional ``parser`` strips raw bytes (Inline XBRL, generic HTML)
-    down to clean prose before extraction. When omitted, the pipeline
-    picks one via :func:`midas.parsers.select_parser` based on
-    ``raw.source_type`` — XBRL parser for SEC forms, pass-through for
-    sources that already deliver UTF-8 prose.
-
-    Commits on success.
+    Returns ``(source, document_text, is_new_source)``. Factored out so
+    both the single-doc and batch ingest paths can reuse it before
+    diverging on how they call the extractor.
     """
-    stats = IngestStats(documents_seen=1)
-
-    # 1. Source: upsert by content_sha256.
     source_repo = SourceRepository(session)
     pre_existing = await source_repo.get_by_content_sha256(raw.content_sha256)
     source = await source_repo.upsert(
@@ -127,35 +113,29 @@ async def ingest_raw_document(
             content_sha256=raw.content_sha256,
         ),
     )
-    if pre_existing is None:
-        stats.sources_added += 1
-    else:
-        stats.sources_skipped_duplicate += 1
-
-    # 2. Parse: raw bytes -> clean prose. SEC iXBRL gets the XBRL strip
-    # treatment; press releases / RSS pass through (they're already prose).
     active_parser = parser if parser is not None else select_parser(raw)
     document_text = active_parser.parse(raw)
+    return source, document_text, pre_existing is None
 
-    # 3. Extract.
-    context = ExtractionContext(
-        source_id=source.id,
-        source_url=raw.url,
-        source_type=raw.source_type,
-        known_parties=resolver.known_parties,
-        document_text=document_text,
-    )
-    extracted: list[ExtractedDeal] = await extractor.extract(context)
 
-    # 4. Resolve + persist.
+async def _resolve_and_persist_deals(
+    session: AsyncSession,
+    *,
+    source: Source,
+    deals: list[ExtractedDeal],
+    resolver: EntityResolver,
+    stats: IngestStats,
+) -> None:
+    """Walk extracted deals through entity resolution + dedup + persist.
+
+    Updates ``stats`` in-place. Same logic the single-doc path used
+    inline pre-V1.9.4; factored out so the batch path can reuse it
+    without diverging on dedup semantics.
+    """
     deal_repo = DealRepository(session)
     evidence_repo = EvidenceRepository(session)
 
-    for ed in extracted:
-        # V1.8 open-world resolution: resolve_or_create auto-creates a
-        # discovered Entity row when a party isn't in the registry but
-        # passes the quality filter. Returns None only when the name is
-        # generic / unparseable ("we", "the Company", "bondholders").
+    for ed in deals:
         before_known = len(resolver.known_parties)
         from_id = await resolver.resolve_or_create(session, ed.source_party_name)
         to_id = await resolver.resolve_or_create(session, ed.target_party_name)
@@ -172,7 +152,6 @@ async def ingest_raw_document(
             )
             continue
 
-        # V1.6 dedup: do we already have this deal?
         existing = await find_matching_deal(
             session,
             from_entity_id=from_id,
@@ -225,6 +204,125 @@ async def ingest_raw_document(
             ],
         )
         stats.evidence_spans_added += 1
+
+
+async def ingest_raw_document(
+    *,
+    session: AsyncSession,
+    raw: RawDocument,
+    extractor: Extractor,
+    resolver: EntityResolver,
+    parser: Parser | None = None,
+) -> IngestStats:
+    """Persist one fetched document end-to-end.
+
+    Idempotent at the Source level (via ``content_sha256`` upsert); when
+    the same document is ingested twice the second call is mostly a
+    no-op for sources but will re-run extraction and re-insert deals.
+    Deal-level dedup is deferred to V1.5.
+
+    The optional ``parser`` strips raw bytes (Inline XBRL, generic HTML)
+    down to clean prose before extraction. When omitted, the pipeline
+    picks one via :func:`midas.parsers.select_parser` based on
+    ``raw.source_type`` — XBRL parser for SEC forms, pass-through for
+    sources that already deliver UTF-8 prose.
+
+    Commits on success.
+    """
+    stats = IngestStats(documents_seen=1)
+    source, document_text, is_new = await _upsert_source_and_parse(session, raw, parser)
+    if is_new:
+        stats.sources_added += 1
+    else:
+        stats.sources_skipped_duplicate += 1
+
+    context = ExtractionContext(
+        source_id=source.id,
+        source_url=raw.url,
+        source_type=raw.source_type,
+        known_parties=resolver.known_parties,
+        document_text=document_text,
+    )
+    extracted: list[ExtractedDeal] = await extractor.extract(context)
+
+    await _resolve_and_persist_deals(
+        session,
+        source=source,
+        deals=extracted,
+        resolver=resolver,
+        stats=stats,
+    )
+    await session.commit()
+    return stats
+
+
+async def ingest_raw_documents_batched(
+    *,
+    session: AsyncSession,
+    raws: list[RawDocument],
+    extractor: Any,  # must expose ``extract_many``; runtime-checked below
+    resolver: EntityResolver,
+    parser: Parser | None = None,
+) -> IngestStats:
+    """Ingest many documents in one batched extraction round.
+
+    All raws first get source-upserted + parsed serially (cheap), then a
+    single ``extractor.extract_many(contexts)`` call extracts deals for
+    every doc in one Anthropic batch (50% cost saving). Per-doc resolve
+    + persist runs sequentially in order so entity discoveries from
+    earlier docs are visible to the resolver before later docs commit.
+
+    Same correctness model as the per-doc :func:`ingest_raw_document`:
+    one session.commit() at the end after all docs persist successfully,
+    so a single broken doc rolls the whole batch back. The caller is
+    expected to batch by feed (typically tens of docs), not the entire
+    ingest run.
+    """
+    if not hasattr(extractor, "extract_many"):
+        raise TypeError(
+            f"extractor {type(extractor).__name__!r} has no extract_many; "
+            "use ingest_raw_document for non-batchable extractors.",
+        )
+    if not raws:
+        return IngestStats()
+
+    stats = IngestStats(documents_seen=len(raws))
+
+    # Step 1: upsert sources + parse text for every raw (serial, cheap).
+    per_doc: list[tuple[Source, ExtractionContext]] = []
+    for raw in raws:
+        source, document_text, is_new = await _upsert_source_and_parse(session, raw, parser)
+        if is_new:
+            stats.sources_added += 1
+        else:
+            stats.sources_skipped_duplicate += 1
+        per_doc.append(
+            (
+                source,
+                ExtractionContext(
+                    source_id=source.id,
+                    source_url=raw.url,
+                    source_type=raw.source_type,
+                    known_parties=resolver.known_parties,
+                    document_text=document_text,
+                ),
+            ),
+        )
+
+    # Step 2: ONE batch call for every doc's extraction.
+    contexts = [ctx for _, ctx in per_doc]
+    extracted_per_doc: list[list[ExtractedDeal]] = await extractor.extract_many(contexts)
+
+    # Step 3: resolve + persist each doc's deals in order, so cross-doc
+    # entity discovery still flows through the resolver.
+    for (source, _ctx), deals in zip(per_doc, extracted_per_doc, strict=True):
+        await _resolve_and_persist_deals(
+            session,
+            source=source,
+            deals=deals,
+            resolver=resolver,
+            stats=stats,
+        )
 
     await session.commit()
     return stats
@@ -305,19 +403,29 @@ async def ingest_ir_press(
 
     resolver = await EntityResolver.from_session(session)
 
+    raws: list[RawDocument] = []
     total = IngestStats()
     for item in items:
         try:
-            raw = await press.fetch_article(item)
+            raws.append(await press.fetch_article(item))
         except Exception as exc:
             total.errors.append(f"{config.publisher}/{item.url}: {exc}")
-            continue
-        total += await ingest_raw_document(
+
+    if hasattr(extractor, "extract_many"):
+        total += await ingest_raw_documents_batched(
             session=session,
-            raw=raw,
+            raws=raws,
             extractor=extractor,
             resolver=resolver,
         )
+    else:
+        for raw in raws:
+            total += await ingest_raw_document(
+                session=session,
+                raw=raw,
+                extractor=extractor,
+                resolver=resolver,
+            )
     return total
 
 
@@ -359,20 +467,33 @@ async def ingest_rss_feed(
 
     resolver = await EntityResolver.from_session(session)
 
+    # Fetch all articles up front so we can either feed them one-by-one
+    # to ingest_raw_document (real-time) or hand the whole batch to
+    # ingest_raw_documents_batched.
+    raws: list[RawDocument] = []
     total = IngestStats()
     for item in items:
         try:
-            raw = await feed.fetch_article(item)
+            raws.append(await feed.fetch_article(item))
         except Exception as exc:
             total.errors.append(f"{publisher}/{item.url}: {exc}")
             log.warning("pipeline.rss.fetch_failed", url=item.url, error=str(exc))
-            continue
-        total += await ingest_raw_document(
+
+    if hasattr(extractor, "extract_many"):
+        total += await ingest_raw_documents_batched(
             session=session,
-            raw=raw,
+            raws=raws,
             extractor=extractor,
             resolver=resolver,
         )
+    else:
+        for raw in raws:
+            total += await ingest_raw_document(
+                session=session,
+                raw=raw,
+                extractor=extractor,
+                resolver=resolver,
+            )
     return total
 
 
@@ -407,9 +528,10 @@ async def ingest_playwright_source(
                     ],
                 )
 
+            raws: list[RawDocument] = []
             for item in items:
                 try:
-                    raw = await source.fetch_article(item)
+                    raws.append(await source.fetch_article(item))
                 except Exception as exc:
                     total.errors.append(f"{config.publisher}/{item.url}: {exc}")
                     log.warning(
@@ -417,13 +539,21 @@ async def ingest_playwright_source(
                         url=item.url,
                         error=str(exc),
                     )
-                    continue
-                total += await ingest_raw_document(
+            if hasattr(extractor, "extract_many"):
+                total += await ingest_raw_documents_batched(
                     session=session,
-                    raw=raw,
+                    raws=raws,
                     extractor=extractor,
                     resolver=resolver,
                 )
+            else:
+                for raw in raws:
+                    total += await ingest_raw_document(
+                        session=session,
+                        raw=raw,
+                        extractor=extractor,
+                        resolver=resolver,
+                    )
     except Exception as exc:
         # Browser launch failure (Chromium missing, OS error).
         log.warning(
